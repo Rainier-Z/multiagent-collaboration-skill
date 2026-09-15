@@ -52,4 +52,4 @@
 ## 八、产出规范
 
 1. 所有参与方结论收敛后，由文档创建者（或人指定的参与方）将文档转为 word 供人查看。
-2. word 转换使用脚本：`C:\Users\86158\Documents\CC-Projects\State_limited_workflow\docs\md_to_docx.py`（python-docx，中文字体微软雅黑）。
+2. word 转换使用脚本：`scripts/export_docx.py`（python-docx，中文字体微软雅黑）。
