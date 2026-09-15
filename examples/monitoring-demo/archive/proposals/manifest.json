@@ -1,0 +1,24 @@
+{
+  "discussion_id": "mon-demo",
+  "recorded_at": "2026-08-09T21:31:01+08:00",
+  "entries": [
+    {
+      "agent": "claude-a",
+      "filename": "claude-a-提案文档.md",
+      "sha256": "31495bc7bff8d07f26824273cde758812d7f6a37510e37a00084ce76f3c2c65c",
+      "mtime": "2026-08-09T21:29:34+08:00"
+    },
+    {
+      "agent": "claude-b",
+      "filename": "claude-b-提案文档.md",
+      "sha256": "095e8e396f0362561c738ddaf798a377e2961cc2d3c1d5771f25a2b183f6509d",
+      "mtime": "2026-08-09T21:29:50+08:00"
+    },
+    {
+      "agent": "claude-c",
+      "filename": "claude-c-提案文档.md",
+      "sha256": "8b6dbd3d3fb0d3df90960462ec8c6c9cc5e929524c7658173734e1b14d776086",
+      "mtime": "2026-08-09T21:29:45+08:00"
+    }
+  ]
+}

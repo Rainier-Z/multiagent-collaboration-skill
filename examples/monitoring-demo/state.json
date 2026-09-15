@@ -1,0 +1,39 @@
+{
+  "protocol_version": "1.0",
+  "discussion_id": "mon-demo",
+  "stage": "monitoring_stopped",
+  "expected_participants": [
+    "claude-a",
+    "claude-b",
+    "claude-c"
+  ],
+  "submission_status": {
+    "claude-a": "submitted",
+    "claude-b": "submitted",
+    "claude-c": "submitted"
+  },
+  "response_status": {
+    "claude-a": "submitted",
+    "claude-b": "submitted",
+    "claude-c": "submitted"
+  },
+  "coordinator": "claude-a",
+  "coordination_lease_until": "2026-08-09T21:38:33+08:00",
+  "coordinator_timeout": 300,
+  "participant_timeout": 900,
+  "proposal_disposition": "archive",
+  "monitoring": {
+    "enabled": false,
+    "mode": "reply_before",
+    "interval_seconds": 120,
+    "status": "stopped"
+  },
+  "candidate_decision_ids": [
+    "D-mon-01"
+  ],
+  "confirmed_decision_ids": [
+    "D-mon-01"
+  ],
+  "last_checked_at": "2026-08-09T21:28:20+08:00",
+  "revision": 14
+}

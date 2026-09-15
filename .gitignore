@@ -1,0 +1,17 @@
+# Local runtime state and generated caches
+.multiagent/
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# Local credentials and signing material
+.env
+.env.*
+*.pem
+*.key
+
+# Internal implementation notes and test evidence
+docs/superpowers/
+
+# Generated Word companion; Markdown remains the source
+README.docx

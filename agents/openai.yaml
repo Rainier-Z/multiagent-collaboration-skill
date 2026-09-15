@@ -1,0 +1,42 @@
+# Codex participant wake contract — designed, not validated.
+name: codex
+platform: openai
+role: independent_participant
+status: designed_not_validated
+
+# The coordinator owns the full Skill. Codex receives only the project Runtime.
+installation:
+  full_skill: coordinator_only
+  participant_runtime: project_scoped
+  global_participant_install: false
+
+wake_contract:
+  request_fields:
+    - workspace
+    - agent_id
+    - instruction_id
+    - runtime_version
+  accepted_means: "The external platform accepted a locator-only handoff; it does not mean work completed."
+  unavailable_means: "No verified Codex wake endpoint is configured. Rainier must explicitly start the participant once."
+  default_result: unavailable
+
+participant_boundaries:
+  read:
+    - project-context.md
+    - runtime/participant/<version>/
+    - instructions/<agent-id>/
+    - phase-authorized-public-inputs
+  write:
+    - proposals/<agent-id>-提案文档.md
+    - responses/<agent-id>-交叉回应文档.md
+    - receipts/<agent-id>/
+  forbidden:
+    - state.json
+    - main-discussion-markdown
+    - other-participant-directories
+    - runtime/
+    - instructions/
+
+security:
+  credentials_in_project_files: forbidden
+  proposal_or_discussion_body_in_wake_request: forbidden
