@@ -4,29 +4,29 @@
 
 每个协作身份由四个独立字段标识：`agent_id`（逻辑身份）、`role`（coordinator 或 participant）、`platform_id`（平台身份）、`session_id`（明确会话）。协调者必须在启动时显式绑定四项；不得从默认平台、进程或会话推断身份。状态字段按 `references/state-schema.md` 与初始化器实现的 `coordinator_binding`、`participant_bindings` 契约使用。
 
-协调者负责门禁编排、状态与讨论内容写入、候选/正式文档生成；参与者只处理分配给自己的完整指令并写自己的产物和回执。参与者不得运行编排器、修改状态或争夺协调权。只有 Rainier 可确认候选决策。
+协调者同时拥有两个逻辑身份：`coordinator:<id>` 负责推进状态，`participant:<id>` 负责独立发言。它必须和其他参与者一样先提交自己的 proposal，在全部 proposal 完成前不得读取其他提案。参与者只处理分配给自己的完整指令并写自己的产物和回执；只有协调者更新状态，只有 Rainier 可确认候选决策。
 
 ## （二）事件、门禁、唤醒与执行
 
 四类职责彼此独立：
 
-1. 监测器只读观察文件变化；常驻监测不是主流程依赖。
+1. Monitor 只读观察与当前 Agent 相关的新事件/指令；常驻监测不是主流程推进器。
 2. 门禁编排器在有效产物或回执写入后由协调者单次调用，校验证据并选择唯一可执行的下一步。可选看门狗只处理超时和恢复。
-3. 唤醒适配器把最小定位请求投递到显式绑定的平台会话；平台无可用唤醒时诚实返回阻塞，或由 Rainier 做一次显式激活。
+3. Activation Bridge 把最小定位请求投递到显式绑定的平台会话，并返回 `activated`、`manual_activation_required` 或 `activation_failed`；平台无可用唤醒时不得假装成功。
 4. Participant Runtime 读取自己的原始指令，在约束内执行并写入产物/回执。
 
-因此主链路是“产物或回执写入 → 单次门禁 → 必要时一次唤醒 → 参与者执行 → 新产物或回执”。扫描日志、`accepted` handoff 或聊天文本均不是执行完成证据。参与者无需启动通用轮询脚本。
+因此主链路是“产物/回执 → append event → 更新 state 快照 → 单次门禁 → 必要时激活 → 参与者执行 → 新事件”。扫描日志、`accepted` handoff 或聊天文本均不是执行完成证据。参与者无需启动通用轮询脚本。
 
 ## （三）收敛与交付顺序
 
-状态机只使用唯一的正常阶段链：`initialized → independent_proposal → cross_response → candidate_decision → user_confirmation → confirmed_decision → delivered`。门禁只推进确定性且证据充分的转换，交付顺序为：
+状态机使用 `initialized → independent_proposal → cross_response(round=N) → candidate_decision → human_review → finalizing → confirmed_decision → delivered`。`state.json` 是快照，`.multiagent/audit/events.jsonl` 是事实流；事务日志缺失或不一致时拒绝推进。门禁只推进确定性且证据充分的转换，交付顺序为：
 
 1. 完成独立提案、交叉回应并收敛意见；阶段输入须满足隔离验证要求。提案合并成功后默认自动删除每位参与者的临时提案源件，不询问用户；仅在 `.multiagent/audit/` 保留源路径、SHA-256、处置时间和处置结果。不得创建或复制 archive。显式兼容选项 `archive` 只允许原位保留源件，不得复制到归档目录。
 2. 生成候选 Markdown，标记 `candidate`，保留共识、分歧、依据、风险和待选择问题。
 3. 从该候选 Markdown 生成候选 Word，记录源哈希。
-4. 只有候选 Word 自动打开成功，记录 `candidate_delivery.opened/opened_at` 后，协调者必须向每位参与者发出一条唯一 `stop` 指令。逐一收齐每个绑定会话的唯一 `completed` stop 回执，并核验对应执行证据后，才能记录 `monitoring.enabled=false`、`monitoring.status=stopped`、`monitoring.stop_requested_at` 并进入 `user_confirmation`。单改 state 字段不等于实际停止；少一条回执、重复/身份不符回执或停止证据无效都必须留在 `candidate_decision`。OpenClaw 的 stop 回执必须证明本项目 Automation 已移除。候选 Word 打开失败时保持 `candidate_decision`，不得开始停止与确认阶段。
-5. 等待 Rainier 查看候选 Word 并作明确确认；候选不得视为正式决策，确认工具必须校验候选文件、哈希、打开时间及监测停止字段。
-6. 确认后才将正式决策固化到主讨论 Markdown，并记录确认原文、时间和修订号，阶段进入 `confirmed_decision`。
+4. 候选 Word 自动打开成功后进入 `human_review`，监测继续运行；候选不是正式决策。
+5. Rainier 确认后先将正式决策固化到主讨论 Markdown，记录确认原文、时间和修订号，阶段进入 `finalizing`。
+6. 只有正式结论已发布，协调者才向每位参与者发出一条唯一 `stop` 指令；收齐每个绑定会话的唯一 `completed` stop 回执和有效证明后才停止监测并进入 `confirmed_decision`。
 7. 从固化后的 Markdown 生成正式 Word 并自动打开；只有打开成功才进入 `delivered`，打开失败时保留 `confirmed_decision`。
 
 候选 Markdown 与 manifest 位于 `.multiagent/deliverables/`；工作区根目录只保留 `project-context.md`、主讨论 Markdown、`候选决策.docx`、`最终决策.docx`。提案合并后的临时提案源件按默认策略删除，审计区只保留路径与哈希处置清单；回应源件留在 `.multiagent/views/<agent_id>/outputs/`，必要内容合并至主讨论 Markdown。不得复制提案归档；显式 `archive` 兼容策略仅原位保留。`monitoring_stopped` 仅用于显式停止或旧工作区兼容，不属于上述正常阶段链。
@@ -48,6 +48,8 @@ OpenClaw 的证明还必须包含 `automation_job_id`、`removal_verified=true`�
 威胁模型不覆盖工作区拥有者直接篡改 `state.json` 或其他本地账本；普通文件系统协议无法阻止有权写入工作区的拥有者伪造、回滚或重写状态。严格独立性必须依赖工作区外的可信适配器与签名密钥，以及平台强制执行的沙箱/访问证据；签名验证器须在信任边界之外保护私钥并验证适配器提交的证据。若平台无法提供所需执行证据，严格独立性门禁必须阻断，不得降级到提示词声明、同用户 ACL 或自签名证明。当前平台是否可提供此类 attestation 必须另行端到端验证，文档不得声称已经验证。缺少证据时，状态必须标记隔离未验证，不得称为严格独立样本，也不得以该标签通过独立性门禁。
 
 参与者在独立提案阶段只能读取自己的密封视图、通用项目上下文和白名单内模板；不得接触其他参与者材料或主讨论 Markdown。交叉回应阶段只可读取指令明确纳入的新视图。阶段切换由一次门禁决定。
+
+> 新协议覆盖说明：候选 Word 打开后只进入 `human_review`，不会停止监测；Rainier 确认并发布正式结论后进入 `finalizing`，再执行 stop 门禁并进入 `confirmed_decision`。`user_confirmation` 仅是旧工作区兼容名称。
 
 ## （五）紧凑工作区与回执
 

@@ -27,6 +27,8 @@ from adapters.openclaw.stop_adapter import (  # noqa: E402
     OpenClawStopError,
     stop_openclaw_automation,
 )
+from adapters.common.wake_protocol import ActivationResult, WakeRequest, WakeResult  # noqa: E402
+import monitor_discussion  # noqa: E402
 from attestation_keys import verify_payload_signature  # noqa: E402
 from participant_runtime.protocol import Instruction, load_stop_attestation  # noqa: E402
 from cryptography.hazmat.primitives import serialization  # noqa: E402
@@ -322,6 +324,96 @@ class OpenClawStopAdapterTests(unittest.TestCase):
             )
         self.assertEqual(commands, [])
 
+
+class ActivationBridgeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.request = WakeRequest(
+            workspace=Path("workspace"),
+            agent_id="claude-a",
+            instruction_id="I-0001",
+            runtime_version="1.0.0",
+            platform_id="claude-code",
+            session_id="session-1",
+        )
+
+    def test_unconfigured_adapters_require_manual_activation(self) -> None:
+        from adapters.claude.wake_adapter import ClaudeCodeWakeAdapter
+        from adapters.codex.wake_adapter import CodexWakeAdapter
+        from adapters.openclaw.wake_adapter import OpenClawWakeAdapter
+
+        for adapter_type in (ClaudeCodeWakeAdapter, CodexWakeAdapter, OpenClawWakeAdapter):
+            with self.subTest(adapter=adapter_type.__name__):
+                result = adapter_type().activate(self.request)
+                self.assertEqual(result.status, "manual_activation_required")
+
+    def test_activation_bridge_has_three_states_and_never_uses_scan_as_success(self) -> None:
+        from adapters.claude.wake_adapter import ClaudeCodeWakeAdapter
+
+        self.assertEqual(
+            ClaudeCodeWakeAdapter(lambda _: ActivationResult("activated", evidence="dispatch-proof"))
+            .activate(self.request).status,
+            "activated",
+        )
+        self.assertEqual(
+            ClaudeCodeWakeAdapter(lambda _: ActivationResult("activation_failed", "rejected"))
+            .activate(self.request).status,
+            "activation_failed",
+        )
+        self.assertEqual(
+            ClaudeCodeWakeAdapter(lambda _: WakeResult("accepted"))
+            .activate(self.request).status,
+            "activated",
+        )
+        with tempfile.TemporaryDirectory(prefix="activation-scan-") as raw:
+            monitor = monitor_discussion.scan_agent_events(raw, "claude-a")
+            self.assertFalse(monitor.has_events)
+            self.assertNotEqual(monitor.lifecycle, "activated")
+
+    def test_dispatcher_exception_is_activation_failed(self) -> None:
+        from adapters.claude.wake_adapter import ClaudeCodeWakeAdapter
+
+        result = ClaudeCodeWakeAdapter(lambda _: (_ for _ in ()).throw(RuntimeError("offline"))).activate(self.request)
+        self.assertEqual(result.status, "activation_failed")
+
+
+class MonitorLifecycleTests(unittest.TestCase):
+    def test_monitor_filters_to_current_agent_and_stops_and_resumes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="monitor-lifecycle-") as raw:
+            workspace = Path(raw)
+            own_instruction = workspace / ".multiagent" / "instructions" / "claude-a"
+            other_instruction = workspace / ".multiagent" / "instructions" / "codex-a"
+            own_receipt = workspace / ".multiagent" / "receipts" / "claude-a"
+            own_instruction.mkdir(parents=True)
+            other_instruction.mkdir(parents=True)
+            own_receipt.mkdir(parents=True)
+            (workspace / ".multiagent" / "state.json").parent.mkdir(exist_ok=True)
+            (workspace / ".multiagent" / "state.json").write_text('{"stage":"cross_response"}', encoding="utf-8")
+            (own_instruction / "old.json").write_text("{}", encoding="utf-8")
+
+            monitor = monitor_discussion.DiscussionMonitor(workspace, "claude-a")
+            self.assertEqual(monitor.scan().events, ())
+
+            (own_instruction / "new.json").write_text("{}", encoding="utf-8")
+            (other_instruction / "other.json").write_text("{}", encoding="utf-8")
+            active = monitor.scan()
+            self.assertEqual(active.lifecycle, "active")
+            self.assertEqual([event.path for event in active.events], [
+                ".multiagent/instructions/claude-a/new.json",
+            ])
+
+            self.assertEqual(monitor.stop(), "stopped")
+            (own_receipt / "while-stopped.json").write_text("{}", encoding="utf-8")
+            stopped = monitor.scan()
+            self.assertEqual(stopped.lifecycle, "stopped")
+            self.assertEqual(stopped.events, ())
+
+            self.assertEqual(monitor.resume(), "active")
+            resumed = monitor.scan()
+            self.assertEqual(resumed.lifecycle, "active")
+            self.assertEqual([event.path for event in resumed.events], [
+                ".multiagent/receipts/claude-a/while-stopped.json",
+            ])
+            self.assertEqual(monitor.scan().events, ())
 
 if __name__ == "__main__":
     unittest.main()

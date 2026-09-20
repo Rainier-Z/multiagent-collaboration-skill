@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -123,7 +124,14 @@ def _expected_output(workspace: Path, agent_id: str, instruction: Instruction) -
         permitted = path_in_workspace(workspace, ".multiagent/receipts/%s" % agent_id)
     else:
         permitted = path_in_workspace(workspace, ".multiagent/receipts/%s" % agent_id)
-    if instruction.kind in {"propose", "repair", "respond"} and output != permitted:
+    response_round_output = (
+        instruction.kind == "respond"
+        and re.fullmatch(
+            rf"\.multiagent/views/{re.escape(agent_id)}/outputs/round-[1-9][0-9]*/交叉回应文档\.md",
+            output.relative_to(workspace).as_posix(),
+        )
+    )
+    if instruction.kind in {"propose", "repair", "respond"} and output != permitted and not response_round_output:
         raise WorkflowError("%s: output path is outside participant scope" % E_PATH_SCOPE, E_PATH_SCOPE, output_path=instruction.output_path)
     if instruction.kind not in {"propose", "repair", "respond"} and output != permitted:
         raise WorkflowError("%s: system output path is outside participant receipt scope" % E_PATH_SCOPE, E_PATH_SCOPE, output_path=instruction.output_path)
@@ -200,11 +208,17 @@ def run_instruction(workspace: Path, agent_id: str, instruction_id: str) -> int:
         _expected_output(workspace, agent_id, instruction)
         input_manifest = _validate_inputs(workspace, instruction)
         if instruction.kind in {"propose", "repair"}:
-            isolation_evidence = load_isolation_evidence(workspace, instruction)
+            if instruction.access_scope.get("security_mode", "strict") == "strict":
+                isolation_evidence = load_isolation_evidence(workspace, instruction)
+            else:
+                isolation_evidence = _restricted_view_summary(instruction, input_manifest)
         elif instruction.kind == "stop":
             # A marker written by this runner is only a receipt artifact, never
             # proof that a platform monitor or automation was actually stopped.
-            isolation_evidence = load_stop_attestation(workspace, instruction)
+            if instruction.access_scope.get("security_mode", "strict") == "strict":
+                isolation_evidence = load_stop_attestation(workspace, instruction)
+            else:
+                isolation_evidence = _restricted_view_summary(instruction, input_manifest)
         else:
             isolation_evidence = _restricted_view_summary(instruction, input_manifest)
         _accepted(workspace, agent_id, instruction, isolation_evidence)

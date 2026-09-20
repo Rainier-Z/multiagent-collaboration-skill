@@ -12,11 +12,11 @@
 
 ## 三、唤醒语义
 
-适配器只接收工作区、参与者 ID、指令 ID 和 Runtime 版本。任何真实 dispatcher 都必须经过独立端到端验证，且不得接收提案、回应或主讨论正文。即使 dispatcher 返回 `accepted`，也只能说明 handoff 已投递；完成仍由 Runtime 回执和输出哈希证明。
+适配器只接收 `WakeRequest` 定位字段。任何真实 dispatcher 都必须经过独立端到端验证，且不得接收提案、回应或主讨论正文。`activate()` 返回 `activated` 也只能说明 handoff 已投递；完成仍由 Runtime 回执和输出哈希证明。没有 dispatcher 时返回 `manual_activation_required`，调用失败时返回 `activation_failed`。
 
 未配置 dispatcher 时，协调者应记录 `E_PLATFORM_UNAVAILABLE` 并由 Rainier 显式启动参与者一次。传感器只能报告变化，不能完成唤醒。
 
-OpenClaw 的原生 Automation 与本适配器的 direct wake 是两条独立链路：前者使已配置的 OpenClaw 参与者定期检查共享工作区，后者是协调者向一个既有会话投递最小 `WakeRequest` 的能力。前者存在、任务创建成功或后台扫描有输出，都不能把后者标记为 `accepted` 或可用。默认状态继续是 `unavailable`，直至保存端到端验证证据。
+OpenClaw 的原生 Automation 与本适配器的 direct wake 是两条独立链路：前者使已配置的 OpenClaw 参与者定期检查共享工作区，后者是协调者向一个既有会话投递最小 `WakeRequest` 的能力。前者存在、任务创建成功或后台扫描有输出，都不能把后者标记为 `activated` 或可用。默认状态继续是 `manual_activation_required`，直至保存端到端验证证据。
 
 ## 四、Automation 执行门槛
 

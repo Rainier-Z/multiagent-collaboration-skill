@@ -1,6 +1,6 @@
 # 一、Multiagent Collaboration Skill
 
-这是一个面向独立意见协商的协调者 Skill。参与者围绕同一议题形成独立提案与交叉回应；系统只生成待审候选，Rainier 查看候选 Word 并明确确认后，才能固化正式决策。
+这是一个面向独立意见协商的协调者 Skill。多个已启动的 Agent 通过共享工作区、事实事件流和多轮回应围绕同一议题协作；协调者同时以 participant 身份独立发言，以 coordinator 身份推进状态。系统只生成待审候选，Rainier 查看候选 Word 并明确确认后，才发布正式决策并停止监测。
 
 ## （一）使用流程
 
@@ -15,7 +15,7 @@
         └── 产物与回执 ◄─┘
 ```
 
-每次有效产物或回执写入后，协调者单次运行门禁。监测只观察事件；门禁判定下一步；平台适配器尝试唤醒；Runtime 执行指令。常驻监测不是主流程依赖，仅可选用于超时或恢复看门狗。
+每次有效产物或回执写入后，协调者单次运行门禁。Event Stream 是事实日志，state.json 是当前快照；Monitor 只发现相关事件，Activation Bridge 只报告真实会话能否继续（activated/manual_activation_required/activation_failed），Runtime 执行指令。常驻监测不是主流程依赖。
 
 ## （二）Skill 目录
 
@@ -42,9 +42,21 @@ multiagent-collaboration/
 2. 用 assets/ 中模板发布项目级指令；每条指令须含完整 task_prompt。
 3. 每次产物或回执写入后，协调者单次运行门禁；完整候选审阅与正式交付顺序以 references/collaboration-protocol.md 为准。
 
+### 假 Agent 闭环演习
+
+在接入 Claude Code、Codex 或 OpenClaw 之前，可先运行三 Agent 的确定性演习，验证“多轮回应 → 收敛评估 → 人工审阅 → 正式决策 → 停机”生命周期：
+
+```powershell
+py -3 -B -m unittest evals.test_convergence -v
+```
+
+该演习只验证协议状态，不声称唤醒了任何真实平台会话。
+
 ### 安全初始化（PowerShell）
 
-每个讨论使用一个 Ed25519 私钥。私钥保存在工作区外，只由可信平台适配器读取；项目工作区只保存公钥/key ID，参与者永远不接收私钥。先 provision，再把公开 key ID 与公钥传给初始化器；把公钥加入运行进程的公开信任表。信任表不是秘密，但必须在每个运行验签的进程中设置；缺失、key ID/公钥不匹配或验签失败均阻断，不降级。
+默认初始化为 `normal` 模式，不需要 Ed25519 参数；它仍使用密封视图、路径白名单、事件流和事务恢复。需要平台隔离证明时，追加 `--security-mode strict` 并提供工作区外的公钥/key ID。
+
+以下命令是 strict 模式示例。strict 模式每个讨论使用一个 Ed25519 私钥；私钥保存在工作区外，只由可信平台适配器读取；项目工作区只保存公钥/key ID，参与者永远不接收私钥。先 provision，再把公开 key ID 与公钥传给初始化器；把公钥加入运行进程的公开信任表。信任表不是秘密，但必须在每个运行验签的进程中设置；缺失、key ID/公钥不匹配或验签失败均阻断，不降级。
 
 ```powershell
 $workspace = (Join-Path (Get-Location) 'my-discussion')
@@ -59,6 +71,7 @@ py -3 .\scripts\init_discussion.py $workspace planner-ds planner-ds chatgpt open
   --participant-binding planner-ds=deepseek:session-001 `
   --participant-binding openclaw=openclaw:agent:session=42 `
   --participant-binding chatgpt=chatgpt:session-002 `
+  --security-mode strict `
   --attestation-public-key-b64 $publicKey --attestation-key-id $keyId
 ```
 

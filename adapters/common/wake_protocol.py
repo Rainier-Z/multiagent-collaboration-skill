@@ -15,7 +15,9 @@ from typing import Literal, Protocol
 
 
 WakeStatus = Literal["accepted", "unavailable", "rejected"]
+ActivationStatus = Literal["activated", "manual_activation_required", "activation_failed"]
 _VALID_STATUSES = frozenset({"accepted", "unavailable", "rejected"})
+_VALID_ACTIVATION_STATUSES = frozenset({"activated", "manual_activation_required", "activation_failed"})
 
 
 @dataclass(frozen=True)
@@ -80,6 +82,29 @@ class WakeResult:
         return {"status": self.status, "detail": self.detail, "evidence": self.evidence}
 
 
+@dataclass(frozen=True)
+class ActivationResult:
+    """Result of the Activation Bridge, distinct from file observation.
+
+    ``activated`` means that a verified platform dispatcher accepted the
+    minimal handoff.  It does not mean that the participant executed the
+    instruction.  ``manual_activation_required`` is the honest result when no
+    verified dispatcher exists (including when a background scanner found an
+    instruction).  ``activation_failed`` means an attempted handoff failed.
+    """
+
+    status: ActivationStatus
+    detail: str = ""
+    evidence: str = ""
+
+    def __post_init__(self) -> None:
+        if self.status not in _VALID_ACTIVATION_STATUSES:
+            raise ValueError(f"unsupported activation status: {self.status}")
+
+    def to_dict(self) -> dict[str, str]:
+        return {"status": self.status, "detail": self.detail, "evidence": self.evidence}
+
+
 class WakeAdapter(Protocol):
     """A platform-specific handoff implementation supplied to the coordinator."""
 
@@ -87,6 +112,23 @@ class WakeAdapter(Protocol):
         """Attempt one handoff; never execute participant work in this call."""
 
 
+class ActivationBridge(Protocol):
+    """Platform activation boundary used by sensors and explicit callers."""
+
+    def activate(self, request: WakeRequest) -> ActivationResult:
+        """Activate one bound session; scanning alone is never activation."""
+
+
 def unavailable(platform: str, detail: str = "") -> WakeResult:
     message = detail or f"{platform} has no verified external wake configuration"
     return WakeResult("unavailable", message, "no verified platform dispatch evidence")
+
+
+def manual_activation_required(platform: str, detail: str = "") -> ActivationResult:
+    message = detail or f"{platform} has no verified external activation configuration"
+    return ActivationResult("manual_activation_required", message, "no verified platform dispatch evidence")
+
+
+def activation_failed(platform: str, detail: str = "") -> ActivationResult:
+    message = detail or f"{platform} activation failed"
+    return ActivationResult("activation_failed", message, "platform dispatch failed")

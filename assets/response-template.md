@@ -1,6 +1,6 @@
 # <agent-id> 交叉回应文档
 
-> 使用说明：交叉回应阶段，各参与者只能基于本次指令密封提供的合并讨论副本与项目上下文写作，不得读取归档提案或其他参与者私有文件。写入 `.multiagent/views/<agent-id>/outputs/交叉回应文档.md`，`<agent-id>` 与 `.multiagent/state.json` 的 `expected_participants` 身份键完全一致。UTF-8 编码。共识与分歧须如实保留，不以多数票消解分歧。
+> 使用说明：交叉回应阶段，各参与者只能基于本次指令密封提供的合并讨论副本与项目上下文写作，不得读取归档提案或其他参与者私有文件。写入 `.multiagent/views/<agent-id>/outputs/round-<round>/交叉回应文档.md`，`<agent-id>` 与 `.multiagent/state.json` 的 `expected_participants` 身份键完全一致。UTF-8 编码。共识与分歧须如实保留，不以多数票消解分歧。
 
 ## 交叉回应追溯块
 
@@ -38,3 +38,7 @@
 ### 六、推荐
 
 <本 Agent 的推荐意见>
+
+### 七、新问题与待确认事项
+
+<本轮新出现、尚未解决或需要下一轮回应的问题；没有则填写“无”>

@@ -50,8 +50,9 @@ E_ISOLATION_UNVERIFIED = "E_ISOLATION_UNVERIFIED"
 
 VALID_STAGES = {
     "initialized", "independent_proposal", "proposals_complete",
-    "cross_response", "candidate_decision", "user_confirmation",
-    "confirmed_decision", "delivered", "monitoring_stopped",
+    "cross_response", "human_review", "finalizing", "completed",
+    "candidate_decision", "human_review", "finalizing", "user_confirmation", "confirmed_decision",
+    "delivered", "monitoring_stopped",
 }
 
 
@@ -259,6 +260,20 @@ def validate_state_shape(state: dict[str, Any]) -> None:
         raise WorkflowError("coordinator_binding 身份字段非法", E_SCHEMA)
     if not isinstance(state["revision"], int) or state["revision"] < 1:
         raise WorkflowError("revision 必须为正整数", E_SCHEMA)
+    coordinator_participant = state.get("coordinator_participant")
+    if coordinator_participant is not None:
+        if (
+            not isinstance(coordinator_participant, dict)
+            or coordinator_participant.get("agent_id") != state["coordinator"]
+            or coordinator_participant.get("role") != "participant"
+            or coordinator_participant.get("platform_id") != state["coordinator_binding"].get("platform_id")
+            or coordinator_participant.get("session_id") != state["coordinator_binding"].get("session_id")
+        ):
+            raise WorkflowError("coordinator_participant 必须绑定同一协调者会话并声明 participant 角色", E_SCHEMA)
+    if "round" in state and (isinstance(state["round"], bool) or not isinstance(state["round"], int) or state["round"] < 0):
+        raise WorkflowError("round 必须为非负整数", E_SCHEMA)
+    if state.get("security_mode") is not None and state.get("security_mode") not in {"normal", "strict"}:
+        raise WorkflowError("security_mode 必须为 normal 或 strict", E_SCHEMA)
 
 
 def validate_coordinator_execution(
@@ -405,7 +420,12 @@ def validate_instruction(payload: dict[str, Any]) -> None:
         "repair": f"{view_root}/outputs/提案文档.md",
         "respond": f"{view_root}/outputs/交叉回应文档.md",
     }
-    if output_path.rstrip("/") != expected_outputs.get(str(payload["kind"]), receipt_root):
+    kind = str(payload["kind"])
+    response_round_path = (
+        kind == "respond"
+        and re.fullmatch(rf"{re.escape(view_root)}/outputs/round-[1-9][0-9]*/交叉回应文档\.md", output_path.rstrip("/"))
+    )
+    if output_path.rstrip("/") != expected_outputs.get(kind, receipt_root) and not response_round_path:
         raise WorkflowError("output_path 超出参与者写入范围", E_PATH_SCOPE, path=payload["output_path"])
     if payload["sha256"] != instruction_digest(payload):
         raise WorkflowError("指令哈希不匹配", E_HASH, instruction_id=payload.get("instruction_id"))

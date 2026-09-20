@@ -8,4 +8,4 @@
 | Codex | `codex/wake_adapter.py` | `unavailable` | 协议已设计，未验证外部唤醒入口 |
 | OpenClaw | `openclaw/wake_adapter.py` | `unavailable` | 协议已设计，未验证外部唤醒入口 |
 
-适配器只接收 `workspace`、`agent_id`、`instruction_id` 和 `runtime_version`。`accepted` 仅代表平台接收定位请求；实际执行必须由参与者 Runtime 写入的回执证明。详见 `references/platform-adapters.md`。
+适配器只接收 `WakeRequest` 的定位字段。新接口 `activate()` 只返回 `activated`、`manual_activation_required` 或 `activation_failed`；后台扫描不会返回 `activated`。兼容接口 `wake()` 仍映射为旧的 `accepted`、`unavailable`、`rejected`，实际执行必须由参与者 Runtime 写入的回执证明。详见 `references/platform-adapters.md`。

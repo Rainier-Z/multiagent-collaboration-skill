@@ -204,13 +204,23 @@ def access_scope(workspace: Path, agent_id: str) -> dict[str, object]:
         raise WorkflowError("participant input manifest is unreadable", E_STATE_CONFLICT, agent_id=agent_id) from exc
     if manifest.scope_digest != reference.get("scope_digest"):
         raise WorkflowError("participant input manifest scope digest mismatch", E_STATE_CONFLICT, agent_id=agent_id)
+    state_path = path_in_workspace(workspace, ".multiagent/state.json")
+    security_mode = "strict"
+    try:
+        if state_path.is_file():
+            state_value = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(state_value, dict) and state_value.get("security_mode") in {"normal", "strict"}:
+                security_mode = str(state_value["security_mode"])
+    except (OSError, json.JSONDecodeError):
+        pass
     scope: dict[str, object] = {
         "mode": "sealed_view",
+        "security_mode": security_mode,
         "view_root": root,
         "allowed_read_roots": [root + "/inputs"],
         "allowed_write_roots": [root + "/outputs", ".multiagent/receipts/%s" % agent_id],
         "requires_platform_enforcement": True,
-        "independence_claim_requires_enforcement_receipt": True,
+        "independence_claim_requires_enforcement_receipt": security_mode == "strict",
         "security_note": INDEPENDENCE_NOTE,
         "input_manifest_path": manifest_relative,
         "input_manifest_sha256": reference["sha256"],
@@ -228,10 +238,13 @@ def access_scope(workspace: Path, agent_id: str) -> dict[str, object]:
                 if not isinstance(raw_pin, dict):
                     raise ValueError("state isolation_trust must be an object")
                 trust_pin = raw_pin
-        verifier = configured_verifier_binding(
-            key_id=str(trust_pin.get("key_id")) if trust_pin is not None else None,
-            public_key_b64_value=str(trust_pin.get("public_key_b64")) if trust_pin is not None else None,
-        )
+        if security_mode == "strict":
+            verifier = configured_verifier_binding(
+                key_id=str(trust_pin.get("key_id")) if trust_pin is not None else None,
+                public_key_b64_value=str(trust_pin.get("public_key_b64")) if trust_pin is not None else None,
+            )
+        else:
+            verifier = None
     except ValueError as exc:
         raise WorkflowError("E_ISOLATION_UNVERIFIED: invalid external verifier configuration", "E_ISOLATION_UNVERIFIED") from exc
     if verifier is not None:

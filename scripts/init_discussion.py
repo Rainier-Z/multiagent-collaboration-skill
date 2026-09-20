@@ -21,8 +21,9 @@
     --coordinator-platform ID      协调者实际平台标识（必填）
     --coordinator-session ID       协调者实际会话标识（必填）
     --participant-binding SPEC     每位参与者的实际绑定，重复指定，格式 agent_id=platform_id:session_id
-    --attestation-public-key-b64   Ed25519 公钥信任锚（必填，私钥不得进入工作区）
-    --attestation-key-id           attestation 签名密钥标识（必填）
+    --security-mode normal|strict  普通模式默认不启用 Ed25519；strict 模式要求外置证明
+    --attestation-public-key-b64   Ed25519 公钥信任锚（strict 模式必填，私钥不得进入工作区）
+    --attestation-key-id           attestation 签名密钥标识（strict 模式必填）
     --coordinator-timeout 秒       协调者超时，默认 300（5 分钟）
     --participant-timeout 秒       普通参与者等待，默认 900（15 分钟）
     --disposition archive|delete   提案处置策略，默认 delete；archive 仅原位保留
@@ -50,6 +51,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from workflow_core import atomic_write_json, sha256_file
+from events import EventStream
 from participant_runtime.protocol import Instruction, publish_runtime, write_instruction
 from openclaw_automation import render_openclaw_operational_directive
 from participant_views import access_scope, output_path, publish_inputs
@@ -125,7 +127,7 @@ def normalize_identity_list(participants, coordinator):
 def build_state(discussion_id, participants, coordinator, now,
                 coordinator_platform_id, coordinator_session_id,
                 participant_bindings, coordinator_timeout, participant_timeout, disposition,
-                isolation_trust):
+                isolation_trust, security_mode):
     """按最小字段构建初始 state.json。"""
     return {
         "protocol_version": PROTOCOL_VERSION,
@@ -143,6 +145,7 @@ def build_state(discussion_id, participants, coordinator, now,
         },
         "participant_bindings": participant_bindings,
         "isolation_trust": isolation_trust,
+        "security_mode": security_mode,
         # 协调权租约：初始化时 = 当前时间 + 协调者超时（§8）
         "coordination_lease_until": (
             datetime.fromisoformat(now) + timedelta(seconds=coordinator_timeout)
@@ -159,6 +162,15 @@ def build_state(discussion_id, participants, coordinator, now,
         },
         "candidate_decision_ids": [],
         "confirmed_decision_ids": [],
+        # The coordinator is also a participant.  Its participant view is
+        # independent from its coordinator-side orchestration identity.
+        "coordinator_participant": {
+            "agent_id": coordinator,
+            "role": "participant",
+            "platform_id": coordinator_platform_id,
+            "session_id": coordinator_session_id,
+        },
+        "round": 0,
         "last_checked_at": now,
         "revision": 1,
         # Runtime/queue fields are machine process authority. Participants never write them.
@@ -264,9 +276,11 @@ def main(argv=None):
                         help="协调者实际会话标识，不会由逻辑身份推断")
     parser.add_argument("--participant-binding", action="append", default=[], metavar="SPEC",
                         help="实际参与方绑定 agent_id=platform_id:session_id；必须对每个参与者（含协调者）恰好指定一次")
-    parser.add_argument("--attestation-public-key-b64", required=True,
+    parser.add_argument("--security-mode", choices=("normal", "strict"), default="normal",
+                        help="安全模式；normal 保留路径隔离，strict 额外要求 Ed25519/平台证明")
+    parser.add_argument("--attestation-public-key-b64", required=False,
                         help="平台隔离证明验签用 Ed25519 公钥（Base64）；私钥必须位于项目工作区之外")
-    parser.add_argument("--attestation-key-id", required=True,
+    parser.add_argument("--attestation-key-id", required=False,
                         help="平台隔离证明验签公钥的稳定标识")
     parser.add_argument("--force", action="store_true",
                         help="已存在 state.json 时强制重新初始化")
@@ -309,11 +323,27 @@ def main(argv=None):
     if binding_error:
         print("FAIL: " + binding_error, file=sys.stderr)
         return EXIT_VALIDATION
-    isolation_trust, trust_error = parse_attestation_trust(
-        args.attestation_public_key_b64, args.attestation_key_id)
-    if trust_error:
-        print("FAIL: " + trust_error, file=sys.stderr)
-        return EXIT_VALIDATION
+    security_mode = args.security_mode
+    strict_requested = security_mode == "strict" or bool(args.attestation_public_key_b64 or args.attestation_key_id)
+    if strict_requested:
+        if not args.attestation_public_key_b64 or not args.attestation_key_id:
+            print("FAIL: strict 模式必须同时提供 attestation 公钥与 key ID", file=sys.stderr)
+            raise SystemExit(EXIT_USAGE)
+        isolation_trust, trust_error = parse_attestation_trust(
+            args.attestation_public_key_b64, args.attestation_key_id)
+        if trust_error:
+            print("FAIL: " + trust_error, file=sys.stderr)
+            return EXIT_VALIDATION
+        security_mode = "strict"
+    else:
+        isolation_trust = {
+            "mode": "normal",
+            "status": "not_required",
+            "algorithm": None,
+            "key_id": None,
+            "public_key_b64": None,
+            "private_key_location": "not_configured",
+        }
     if args.coordinator_timeout <= 0 or args.participant_timeout <= 0:
         print("FAIL: 超时时间必须为正整数", file=sys.stderr)
         return EXIT_VALIDATION
@@ -409,7 +439,7 @@ def main(argv=None):
         coordinator_platform, coordinator_session,
         participant_bindings,
         args.coordinator_timeout, args.participant_timeout, args.disposition,
-        isolation_trust)
+        isolation_trust, security_mode)
     state["retry_policy"] = {"max_attempts": args.max_repair_attempts}
     state["convergence"] = {
         "min_response_rounds": args.min_response_rounds,
@@ -446,11 +476,12 @@ def main(argv=None):
             )
             participant_output = output_path(Path(discussion_dir), participant, "bootstrap")
             participant_scope = access_scope(Path(discussion_dir), participant)
-            participant_scope["attestation_verifier"] = {
-                "key_id": isolation_trust["key_id"],
-                "algorithm": "ed25519",
-                "public_key_b64": isolation_trust["public_key_b64"],
-            }
+            if security_mode == "strict":
+                participant_scope["attestation_verifier"] = {
+                    "key_id": isolation_trust["key_id"],
+                    "algorithm": "ed25519",
+                    "public_key_b64": isolation_trust["public_key_b64"],
+                }
             payload = {
                 "instruction_id": instruction_id,
                 "discussion_id": state["discussion_id"],
@@ -487,6 +518,23 @@ def main(argv=None):
         write_state_atomic(state_path, state)
     except OSError as e:
         print("FAIL: 写入 state.json 失败: " + str(e), file=sys.stderr)
+        return EXIT_IO
+    try:
+        EventStream(Path(discussion_dir)).append(
+            "discussion_initialized",
+            {
+                "discussion_id": state["discussion_id"],
+                "coordinator": state["coordinator"],
+                "participants": list(state["expected_participants"]),
+                "stage": state["stage"],
+            },
+            transaction_id="init-" + state["discussion_id"],
+            revision_before=0,
+            revision_after=int(state["revision"]),
+            event_id="init-" + state["discussion_id"],
+        )
+    except Exception as e:
+        print("FAIL: 写入初始化事件日志失败: " + str(e), file=sys.stderr)
         return EXIT_IO
 
     print("OK: 讨论工作区初始化完成: " + discussion_dir)

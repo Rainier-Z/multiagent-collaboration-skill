@@ -10,7 +10,7 @@
 
 ## 三、唤醒语义
 
-适配器只能投递最小 `WakeRequest(workspace, agent_id, instruction_id, runtime_version)`。消息不得包含提案、回应、主讨论正文或凭据。若宿主环境提供了已验证的 dispatcher，可注入该 dispatcher；返回 `accepted` 仅表示请求已投递，必须继续等待项目目录中的 Runtime 回执。
+适配器只能投递最小 `WakeRequest`。消息不得包含提案、回应、主讨论正文或凭据。若宿主环境提供了已验证的 dispatcher，可注入该 dispatcher；`activate()` 返回 `activated` 仅表示请求已投递，必须继续等待项目目录中的 Runtime 回执。没有 dispatcher 时返回 `manual_activation_required`。
 
 没有经验证 dispatcher 时，协调者记录 `E_PLATFORM_UNAVAILABLE`，由 Rainier 显式启动一次 Claude Code 参与者。文件监测器只能发现指令，不能代替这一启动动作。
 

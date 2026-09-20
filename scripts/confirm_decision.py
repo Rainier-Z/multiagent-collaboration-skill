@@ -53,6 +53,7 @@ from workflow_core import (
 )
 from export_docx import _default_state_path, _workspace_root_for_state, do_export
 from orchestrate_discussion import _all_stop_receipts_completed, _read_receipts
+from transactions import EventTransaction
 
 
 def _force_utf8_stdio():
@@ -70,6 +71,10 @@ STAGES = [
     "initialized",
     "independent_proposal",
     "cross_response",
+    "human_review",
+    "finalizing",
+    "human_review",
+    "finalizing",
     "candidate_decision",
     "user_confirmation",
     "confirmed_decision",
@@ -323,10 +328,25 @@ def stop_receipts_gate_error(state, workspace):
     return None
 
 
+def _modern_lifecycle(state):
+    """Whether this state was initialized with the round/event protocol."""
+    return isinstance(state.get("coordinator_participant"), dict) and isinstance(state.get("round"), int)
+
+
 def confirmation_gate_error(state, workspace):
-    """Return a blocking reason unless candidate review and participant stops are proven."""
-    if state.get("stage") != "user_confirmation":
-        return "仅 user_confirmation 阶段允许确认候选决策。"
+    """Validate candidate delivery before human confirmation.
+
+    Participants remain active during human review. Stop evidence is checked
+    after the confirmed final decision is published.
+    """
+    modern = _modern_lifecycle(state)
+    allowed = {"human_review"} if modern else {"user_confirmation", "human_review"}
+    if state.get("stage") not in allowed:
+        return "仅 human_review 阶段允许确认候选决策。"
+    if not modern:
+        legacy_stop_error = stop_receipts_gate_error(state, workspace)
+        if legacy_stop_error:
+            return legacy_stop_error
 
     delivery = state.get("candidate_delivery")
     if not isinstance(delivery, dict) or delivery.get("opened") is not True:
@@ -350,15 +370,6 @@ def confirmation_gate_error(state, workspace):
     if not isinstance(expected_hash, str) or sha256_file(candidate_path) != expected_hash:
         return "候选 Word 哈希缺失或不匹配；禁止确认。"
 
-    stop_error = stop_receipts_gate_error(state, workspace)
-    if stop_error:
-        return stop_error
-
-    monitoring = state.get("monitoring")
-    if not isinstance(monitoring, dict) or monitoring.get("enabled") is not False or monitoring.get("status") != "stopped":
-        return "常规监测尚未标记停止；禁止确认。"
-    if not isinstance(monitoring.get("stop_requested_at"), str) or not monitoring["stop_requested_at"].strip():
-        return "监测停止请求缺少时间记录；禁止确认。"
     return None
 
 
@@ -764,8 +775,8 @@ def main():
         return EXIT_PRECOND
 
     stage = state["stage"]
-    if stage != "user_confirmation":
-        print("阶段 %s 不允许固化决策（需要 user_confirmation）。" % stage, file=sys.stderr)
+    if stage not in {"human_review", "user_confirmation"}:
+        print("阶段 %s 不允许固化决策（需要 human_review）。" % stage, file=sys.stderr)
         return EXIT_PRECOND
     gate_error = confirmation_gate_error(state, base)
     if gate_error:
@@ -866,32 +877,50 @@ def main():
             confirmed.append(candidate_id)
             state["confirmed_decision_ids"] = confirmed
 
-    # 唯一合法转换：user_confirmation → confirmed_decision。
-    state["stage"] = "confirmed_decision"
+    # Publish the confirmed conclusion first. The coordinator orchestrator
+    # issues stop instructions only after this durable finalization marker.
+    modern = _modern_lifecycle(state)
+    state["stage"] = "finalizing" if modern else "confirmed_decision"
     state["revision"] += 1
     _add_confirmed()
     _renew_lease()
     try:
-        write_state(state_path, state)
-    except OSError as e:
-        print("state.json 写入失败：%s" % e, file=sys.stderr)
+        EventTransaction(base).commit(
+            event_type="decision_confirmed",
+            event_payload={
+                "candidate_id": candidate_id,
+                "stage_after": state["stage"],
+                "discussion_path": Path(discussion).name,
+                "discussion_sha256": sha256_file(discussion),
+            },
+            artifacts={},
+            receipts={},
+            expected_revision=base_rev,
+            state_update=state,
+        )
+    except Exception as e:
+        print("state.json / 事件日志写入失败：%s" % e, file=sys.stderr)
         print("恢复入口：主文档已记录确认（含候选决策 ID），幂等重跑本脚本可完成固化。", file=sys.stderr)
         return EXIT_ERR
 
     print("候选决策 %s 已固化（阶段=%s，revision=%d），记录者=%s。" % (
         candidate_id, state["stage"], state["revision"], actor))
-    print("正在生成正式 Word 快照（Markdown 仍是唯一权威内容源）。")
-    return do_export(
-        state_path,
-        state,
-        actor,
-        base,
-        discussion,
-        None,
-        False,
-        open_after=not args.no_open,
-        trusted_execution=True,
-    )[0]
+    if modern:
+        print("最终结论已发布；请运行一次协调器门禁，待参与者停止证明完成后再生成正式 Word。")
+    else:
+        print("候选决策已确认；继续生成正式 Word。")
+        return do_export(
+            state_path,
+            state,
+            actor,
+            base,
+            discussion,
+            None,
+            False,
+            open_after=not args.no_open,
+            trusted_execution=True,
+        )[0]
+    return EXIT_OK
 
 
 if __name__ == "__main__":

@@ -30,6 +30,9 @@ from workflow_core import (
     path_in_workspace, sha256_file, update_content_hash,
     validate_coordinator_execution, validate_state_shape,
 )
+from events import EventStream
+from transactions import EventTransaction, recover_transactions
+from convergence import AgentResponse, ConvergenceEvaluator
 from participant_runtime.protocol import (
     Instruction, Receipt, instruction_path, isolation_evidence_path, load_isolation_evidence,
     load_stop_attestation,
@@ -220,6 +223,7 @@ def _new_instruction(
     *,
     attempt: int = 1,
     output_path: str | None = None,
+    round_number: int | None = None,
     origin_instruction_id: str | None = None,
     root_instruction_id: str | None = None,
     failure_receipt: dict[str, Any] | None = None,
@@ -265,6 +269,11 @@ def _new_instruction(
     inputs = publish_inputs(workspace, agent_id, input_sources, instruction_kind=kind)
     if output_path is None:
         output_path = sealed_output_path(workspace, agent_id, kind)
+    if kind == "respond" and round_number is not None:
+        output_path = (
+            workspace / ".multiagent" / "views" / agent_id / "outputs"
+            / ("round-%d" % round_number) / "交叉回应文档.md"
+        ).relative_to(workspace).as_posix()
     scope = sealed_access_scope(workspace, agent_id)
     payload: dict[str, Any] = {
         "instruction_id": "I-%06d" % counter,
@@ -308,6 +317,8 @@ def _new_instruction(
             str(state.get("discussion_id", workspace.name)),
             str(state.get("coordinator", "unknown")),
         )
+    if kind == "respond" and round_number is not None:
+        payload["task_prompt"] += "\n\n当前交叉回应轮次：%d。只回应本轮输入快照，不得覆盖其他轮次产物。" % round_number
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     payload["sha256"] = hashlib.sha256(canonical).hexdigest()
     return Instruction.from_dict(payload)
@@ -380,6 +391,19 @@ def _wake_existing(workspace: Path, state: dict[str, Any], wake: WakeAdapter, re
                           binding["platform_id"], binding["session_id"])
     wake_result = wake.wake(request)
     _record_wake(workspace, request, wake_result)
+    EventStream(workspace).append(
+        "instruction_issued",
+        {
+            "agent_id": agent_id,
+            "instruction_id": instruction.instruction_id,
+            "kind": instruction.kind,
+            "activation_status": wake_result.status,
+        },
+        transaction_id="instruction-%s" % instruction.instruction_id,
+        revision_before=int(state.get("revision", 0)),
+        revision_after=int(state.get("revision", 0)),
+        event_id="instruction-%s" % instruction.instruction_id,
+    )
     if wake_result.status != "accepted" and E_PLATFORM_UNAVAILABLE not in result.blocking_error_codes:
         result.blocking_error_codes.append(E_PLATFORM_UNAVAILABLE)
 
@@ -393,6 +417,7 @@ def _issue(
     kind: str,
     *,
     attempt: int = 1,
+    round_number: int | None = None,
     origin_instruction_id: str | None = None,
     root_instruction_id: str | None = None,
     failure_receipt: dict[str, Any] | None = None,
@@ -403,6 +428,7 @@ def _issue(
         agent_id,
         kind,
         attempt=attempt,
+        round_number=round_number,
         origin_instruction_id=origin_instruction_id,
         root_instruction_id=root_instruction_id,
         failure_receipt=failure_receipt,
@@ -414,6 +440,19 @@ def _issue(
                           binding["platform_id"], binding["session_id"])
     wake_result = wake.wake(request)
     _record_wake(workspace, request, wake_result)
+    EventStream(workspace).append(
+        "instruction_issued",
+        {
+            "agent_id": agent_id,
+            "instruction_id": instruction.instruction_id,
+            "kind": instruction.kind,
+            "activation_status": wake_result.status,
+        },
+        transaction_id="instruction-%s" % instruction.instruction_id,
+        revision_before=int(state.get("revision", 0)),
+        revision_after=int(state.get("revision", 0)),
+        event_id="instruction-%s" % instruction.instruction_id,
+    )
     if wake_result.status != "accepted" and E_PLATFORM_UNAVAILABLE not in result.blocking_error_codes:
         result.blocking_error_codes.append(E_PLATFORM_UNAVAILABLE)
 
@@ -508,9 +547,41 @@ def _participant_output_path(workspace: Path, agent_id: str, folder: str) -> Pat
     return workspace / ".multiagent" / "views" / agent_id / "outputs" / name.replace(agent_id + "-", "", 1)
 
 
-def _valid_completed_outputs(workspace: Path, state: dict[str, Any], receipts: list[dict[str, Any]], participants: list[str], kinds: set[str], folder: str) -> bool:
+def _response_round(workspace: Path, receipt: dict[str, Any]) -> int:
+    instruction = _find_instruction(workspace, str(receipt.get("agent_id", "")), str(receipt.get("instruction_id", "")))
+    if instruction is None:
+        return 0
+    match = re.search(r"/outputs/round-([1-9][0-9]*)/交叉回应文档\.md$", instruction.output_path)
+    return int(match.group(1)) if match else 1
+
+
+def _round_lifecycle(state: dict[str, Any]) -> bool:
+    """Return True for workspaces initialized with the event/round protocol.
+
+    Older fixtures and workspaces remain readable so the migration can be
+    performed without silently changing their confirmation contract.
+    """
+    return isinstance(state.get("coordinator_participant"), dict) and isinstance(state.get("round"), int)
+
+
+def _valid_completed_outputs(
+    workspace: Path,
+    state: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    participants: list[str],
+    kinds: set[str],
+    folder: str,
+    round_number: int | None = None,
+) -> bool:
     for agent in participants:
-        receipt = _completed_output(receipts, agent, kinds)
+        candidates = [
+            record for record in receipts
+            if record.get("agent_id") == agent
+            and record.get("status") == "completed"
+            and record.get("kind") in kinds
+            and (round_number is None or _response_round(workspace, record) == round_number)
+        ]
+        receipt = candidates[-1] if candidates else None
         if receipt is None:
             return False
         relative = receipt.get("output_path")
@@ -520,16 +591,20 @@ def _valid_completed_outputs(workspace: Path, state: dict[str, Any], receipts: l
             expected = path_in_workspace(workspace, relative)
         except Exception:
             return False
-        if expected.resolve() != _participant_output_path(workspace, agent, folder).resolve():
+        instruction_id = receipt.get("instruction_id")
+        instruction = _find_instruction(workspace, agent, str(instruction_id)) if instruction_id else None
+        if instruction is None or instruction.kind not in kinds:
+            return False
+        if folder == "responses":
+            expected_output = path_in_workspace(workspace, instruction.output_path)
+        else:
+            expected_output = _participant_output_path(workspace, agent, folder)
+        if expected.resolve() != expected_output.resolve():
             return False
         if not expected.is_file() or not expected.read_text(encoding="utf-8").strip():
             return False
         output_hash = receipt.get("output_sha256")
         if not isinstance(output_hash, str) or output_hash != sha256_file(expected):
-            return False
-        instruction_id = receipt.get("instruction_id")
-        instruction = _find_instruction(workspace, agent, str(instruction_id)) if instruction_id else None
-        if instruction is None or instruction.kind not in kinds:
             return False
         try:
             binding = _participant_binding(state, agent)
@@ -539,11 +614,14 @@ def _valid_completed_outputs(workspace: Path, state: dict[str, Any], receipts: l
         except Exception:
             return False
         if instruction.kind in {"propose", "repair"}:
-            try:
-                evidence = load_isolation_evidence(workspace, instruction)
-            except Exception:
-                return False
-            if receipt.get("isolation_evidence") != evidence:
+            if instruction.access_scope.get("security_mode", "strict") == "strict":
+                try:
+                    evidence = load_isolation_evidence(workspace, instruction)
+                except Exception:
+                    return False
+                if receipt.get("isolation_evidence") != evidence:
+                    return False
+            elif not isinstance(receipt.get("isolation_evidence"), dict):
                 return False
     return True
 
@@ -657,11 +735,14 @@ def _all_stop_receipts_completed(
             if not marker.is_file() or receipt.get("output_sha256") != sha256_file(marker):
                 return False
             manifest = validate_input_manifest(workspace, instruction)
-            stop_evidence = load_stop_attestation(workspace, instruction)
+            evidence = receipt.get("isolation_evidence")
+            if instruction.access_scope.get("security_mode", "strict") == "strict":
+                stop_evidence = load_stop_attestation(workspace, instruction)
+            else:
+                stop_evidence = evidence
         except Exception:
             return False
-        evidence = receipt.get("isolation_evidence")
-        if not isinstance(evidence, dict) or evidence != stop_evidence:
+        if not isinstance(evidence, dict) or (instruction.access_scope.get("security_mode", "strict") == "strict" and evidence != stop_evidence):
             return False
     return True
 
@@ -752,19 +833,92 @@ def _build_candidate(workspace: Path, state: dict[str, Any], participants: list[
     sections: list[tuple[str, str]] = []
     for agent in participants:
         path = _participant_output_path(workspace, agent, "responses")
+        if _round_lifecycle(state):
+            path = workspace / ".multiagent" / "views" / agent / "outputs" / f"round-{int(state.get('round', 1))}" / "交叉回应文档.md"
         sections.append((agent, path.read_text(encoding="utf-8")))
     _append_section(document, "## 三、交叉回应", [
-        (agent, "> 来源 SHA-256：`%s`\n\n%s" % (sha256_file(_participant_output_path(workspace, agent, "responses")), text))
+        (agent, "> 来源 SHA-256：`%s`\n\n%s" % (sha256_file(path), text))
         for agent, text in sections
     ])
     _append_section(document, "## 四、结构化决策包", [
         ("候选综合", "以下内容综合独立提案与交叉回应，仅形成候选供 Rainier 审阅；不构成已确认决策。请检查共识、分歧、风险和待选择事项。")
     ])
     _append_section(document, "## 五、候选决策与 Word 审阅", [
-        ("候选审阅", "状态：候选、待 Rainier 审阅，不是正式决策。\n\n- 候选 ID：C-0001\n- 候选 Markdown：`.multiagent/deliverables/candidate.md`\n- 候选 Word：`候选决策.docx`\n- 系统打开成功后，自动停止常规监测；只有 Rainier 明确确认才进入正式交付。")
+        ("候选审阅", "状态：候选、待 Rainier 审阅，不是正式决策。\n\n- 候选 ID：C-0001\n- 候选 Markdown：`.multiagent/deliverables/candidate.md`\n- 候选 Word：`候选决策.docx`\n- 候选 Word 打开后进入 human_review；Rainier 确认并发布正式结论后，才请求参与者停止监测。")
     ])
     if not state.get("candidate_decision_ids"):
         state["candidate_decision_ids"] = ["C-0001"]
+
+
+def _markdown_section_items(text: str, titles: tuple[str, ...]) -> list[str]:
+    """Extract bullet labels from a response section for convergence input."""
+    title_pattern = "|".join(re.escape(title) for title in titles)
+    match = re.search(r"(?ms)^###\s+(?:[一二三四五六七八九十]+、)?(?:" + title_pattern + r").*?\n(.*?)(?=^###\s+|\Z)", text)
+    if not match:
+        return []
+    values: list[str] = []
+    for line in match.group(1).splitlines():
+        value = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)、]\s+)", "", line).strip()
+        if value and not value.startswith("<") and value not in values:
+            values.append(value)
+    return values
+
+
+def _response_records_for_round(
+    workspace: Path,
+    receipts: list[dict[str, Any]],
+    participants: list[str],
+    round_number: int,
+) -> list[AgentResponse]:
+    records: list[AgentResponse] = []
+    for agent in participants:
+        candidates = [
+            record for record in receipts
+            if record.get("agent_id") == agent
+            and record.get("status") == "completed"
+            and record.get("kind") == "respond"
+            and _response_round(workspace, record) == round_number
+        ]
+        if not candidates:
+            continue
+        record = candidates[-1]
+        output = path_in_workspace(workspace, str(record.get("output_path", "")))
+        if not output.is_file():
+            continue
+        text = output.read_text(encoding="utf-8")
+        records.append(
+            AgentResponse(
+                agent,
+                round_number,
+                tuple(_markdown_section_items(text, ("共识点", "共识"))),
+                tuple(_markdown_section_items(text, ("分歧点", "分歧"))),
+                tuple(_markdown_section_items(text, ("新问题", "待确认问题", "待确认"))),
+            )
+        )
+    return records
+
+
+def _evaluate_convergence(
+    workspace: Path,
+    state: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    participants: list[str],
+    current_round: int,
+) -> dict[str, Any] | None:
+    config = state.get("convergence") if isinstance(state.get("convergence"), dict) else {}
+    evaluator = ConvergenceEvaluator(
+        min_response_rounds=int(config.get("min_response_rounds", 1)),
+        max_response_rounds=int(config.get("max_response_rounds", 3)),
+        no_new_issue_rounds=int(config.get("no_new_issue_rounds", 1)),
+        participant_ids=participants,
+    )
+    latest = None
+    for round_number in range(1, current_round + 1):
+        responses = _response_records_for_round(workspace, receipts, participants, round_number)
+        if len(responses) != len(participants):
+            return None
+        latest = evaluator.evaluate_round(responses)
+    return latest.to_dict() if latest is not None else None
 
 
 def orchestrate_once(
@@ -781,6 +935,7 @@ def orchestrate_once(
     workspace = Path(workspace).resolve()
     wake = wake or UnavailableWakeAdapter()
     with StateLock(workspace):
+        recover_transactions(workspace)
         state_path = _state_path(workspace)
         state = load_state(workspace)
         validate_state_shape(state)
@@ -788,11 +943,14 @@ def orchestrate_once(
         ensure_content_consistency(workspace, state)
         if state.get("stage") not in {
             "initialized", "independent_proposal", "cross_response", "candidate_decision",
-            "user_confirmation", "confirmed_decision", "delivered", "monitoring_stopped",
+            "human_review", "finalizing", "completed", "user_confirmation",
+            "confirmed_decision", "delivered", "monitoring_stopped",
         }:
             raise WorkflowError("旧阶段不能由新编排器推进", "E_PHASE", stage=state.get("stage"))
         result = OrchestrationResult(stage=str(state.get("stage", "unknown")))
+        revision_before = int(state.get("revision", 0))
         participants = list(state.get("expected_participants") or [])
+        modern_rounds = _round_lifecycle(state)
         for participant in participants:
             _participant_binding(state, participant)
         receipts = _read_receipts(workspace)
@@ -876,16 +1034,57 @@ def orchestrate_once(
 
         if state.get("stage") in {"initialized", "independent_proposal"} and _valid_completed_outputs(workspace, state, receipts, participants, {"propose", "repair"}, "proposals"):
             _merge_and_dispose(workspace, state, participants)
+            if modern_rounds:
+                state["round"] = 1
             for agent in participants:
                 if not _instruction_exists(workspace, agent, "respond"):
-                    _issue(workspace, state, wake, result, agent, "respond")
+                    _issue(workspace, state, wake, result, agent, "respond", round_number=1 if modern_rounds else None)
             state["stage"] = "cross_response"
             changed = True
 
-        if state.get("stage") == "cross_response" and _valid_completed_outputs(workspace, state, receipts, participants, {"respond"}, "responses"):
-            _build_candidate(workspace, state, participants)
-            state["stage"] = "candidate_decision"
-            changed = True
+        if state.get("stage") == "cross_response":
+            if not modern_rounds:
+                if _valid_completed_outputs(workspace, state, receipts, participants, {"respond"}, "responses"):
+                    _build_candidate(workspace, state, participants)
+                    state["stage"] = "candidate_decision"
+                    changed = True
+            else:
+                current_round = int(state.get("round", 1) or 1)
+                if _valid_completed_outputs(
+                    workspace, state, receipts, participants, {"respond"}, "responses", current_round
+                ):
+                    convergence = _evaluate_convergence(
+                        workspace, state, receipts, participants, current_round
+                    )
+                    if convergence is not None:
+                        state["convergence"] = {
+                            **(state.get("convergence") if isinstance(state.get("convergence"), dict) else {}),
+                            "last_result": convergence,
+                            "evaluated_round": current_round,
+                        }
+                        configured_max = int(
+                            (state.get("convergence") or {}).get("max_response_rounds", 3)
+                        )
+                        if convergence.get("converged") or current_round >= configured_max:
+                            _build_candidate(workspace, state, participants)
+                            state["stage"] = "candidate_decision"
+                            changed = True
+                        else:
+                            next_round = current_round + 1
+                            state["round"] = next_round
+                            for agent in participants:
+                                if not any(
+                                    _response_round(workspace, receipt) == next_round
+                                    and receipt.get("agent_id") == agent
+                                    and receipt.get("status") == "completed"
+                                    for receipt in receipts
+                                    if receipt.get("kind") == "respond"
+                                ):
+                                    _issue(
+                                        workspace, state, wake, result, agent, "respond",
+                                        round_number=next_round,
+                                    )
+                            changed = True
 
         prior_delivery = state.get("candidate_delivery")
         if state.get("stage") == "candidate_decision" and (not isinstance(prior_delivery, dict) or prior_delivery.get("opened") is not True):
@@ -914,10 +1113,21 @@ def orchestrate_once(
                     result.warnings.append(str(delivery.get("open_error")))
                 changed = True
 
-        # Opening the candidate Word requests shutdown but is not proof that
-        # participant monitors stopped. Keep the stage at candidate_decision
-        # until every participant returns a binding- and artifact-checked receipt.
-        if state.get("stage") == "candidate_decision":
+        # Candidate delivery opens the human review window.  Participants keep
+        # their monitors alive until the final decision is published.
+        if state.get("stage") == "candidate_decision" and modern_rounds:
+            delivery = state.get("candidate_delivery")
+            if isinstance(delivery, dict) and delivery.get("opened") is True:
+                monitoring = dict(state.get("monitoring") or {})
+                monitoring.update({"enabled": True, "status": "active"})
+                state["monitoring"] = monitoring
+                state["stage"] = "human_review"
+                changed = True
+
+        # Legacy workspaces retain their original stop-before-confirmation
+        # contract. Newly initialized workspaces use the modern human_review
+        # -> finalizing -> stop order above.
+        if state.get("stage") == "candidate_decision" and not modern_rounds:
             delivery = state.get("candidate_delivery")
             if isinstance(delivery, dict) and delivery.get("opened") is True:
                 if _ensure_stop_instructions(workspace, state, wake, result, participants):
@@ -926,40 +1136,82 @@ def orchestrate_once(
                 if _all_stop_receipts_completed(workspace, state, receipts, participants):
                     stopped_at = _now()
                     monitoring = dict(state.get("monitoring") or {})
-                    monitoring.update({
-                        "enabled": False,
-                        "status": "stopped",
-                        "stopped_at": stopped_at,
-                    })
+                    monitoring.update({"enabled": False, "status": "stopped", "stopped_at": stopped_at})
                     state["monitoring"] = monitoring
-                    automation = dict(state.get("automation") or {})
-                    automation.update({"enabled": False, "stopped_at": stopped_at})
-                    state["automation"] = automation
                     state["stage"] = "user_confirmation"
                     changed = True
                 else:
-                    missing = [
-                        agent for agent in participants
-                        if not any(
-                            record.get("agent_id") == agent
-                            and record.get("kind") == "stop"
-                            and record.get("status") == "completed"
-                            for record in receipts
-                        )
-                    ]
-                    result.warnings.append(
-                        "候选 Word 已打开；常规监测仍处于 stopping，等待参与者 stop completed 回执%s。"
-                        % ("：" + ", ".join(missing) if missing else "（现有回执未通过绑定/产物校验）")
+                    missing = [agent for agent in participants if not any(
+                        record.get("agent_id") == agent and record.get("kind") == "stop" and record.get("status") == "completed"
+                        for record in receipts
+                    )]
+                    result.warnings.append("候选 Word 已打开；等待参与者 stop completed 回执%s。" % ("：" + ", ".join(missing) if missing else ""))
+
+        # Stop is issued only after the confirmed final decision is published.
+        if state.get("stage") in {"finalizing", "confirmed_decision"}:
+            if _ensure_stop_instructions(workspace, state, wake, result, participants):
+                changed = True
+            receipts = _read_receipts(workspace)
+            if _all_stop_receipts_completed(workspace, state, receipts, participants):
+                stopped_at = _now()
+                monitoring = dict(state.get("monitoring") or {})
+                monitoring.update({"enabled": False, "status": "stopped", "stopped_at": stopped_at})
+                state["monitoring"] = monitoring
+                automation = dict(state.get("automation") or {})
+                automation.update({"enabled": False, "stopped_at": stopped_at})
+                state["automation"] = automation
+                # Monitors are now stopped; leave a durable confirmed_decision
+                # marker so the next pass can create/open the formal Word.
+                state["stage"] = "confirmed_decision"
+                changed = True
+
+        if state.get("stage") == "confirmed_decision" and not isinstance(state.get("formal_delivery"), dict):
+            document = _main_markdown(workspace)
+            if document is not None:
+                try:
+                    code, delivered_state = export_docx.do_export(
+                        _state_path(workspace),
+                        state,
+                        actor or "",
+                        workspace,
+                        str(document),
+                        None,
+                        False,
+                        open_after=open_candidate,
+                        opener=opener,
+                        platform_id=platform_id,
+                        session_id=session_id,
+                        trusted_execution=True,
                     )
+                except Exception as exc:
+                    code, delivered_state = 1, state
+                    result.warnings.append("正式 Word 生成异常：%s" % exc)
+                if code == 0:
+                    state = delivered_state
+                    result.stage = str(state.get("stage", "unknown"))
+                    return result
+                result.warnings.append("正式 Word 尚未交付，保留 confirmed_decision 状态。")
 
         if _project_machine_indexes(state, workspace, receipts, participants):
             changed = True
 
         if changed:
             update_content_hash(workspace, state)
-            state["revision"] = int(state.get("revision", 0)) + 1
             state["last_orchestrated_at"] = _now()
-            atomic_write_json(state_path, state)
+            transaction = EventTransaction(workspace)
+            transaction.commit(
+                event_type="orchestration_state_changed",
+                event_payload={
+                    "stage_before": result.stage,
+                    "stage_after": state.get("stage"),
+                    "round": state.get("round", 0),
+                    "issued_instruction_ids": list(result.issued_instruction_ids),
+                    "blocking_error_codes": list(result.blocking_error_codes),
+                },
+                expected_revision=revision_before,
+                state_update=state,
+            )
+            state["revision"] = revision_before + 1
         result.stage = str(state.get("stage", "unknown"))
         return result
 

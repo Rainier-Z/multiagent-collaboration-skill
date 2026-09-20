@@ -179,12 +179,15 @@ def _validate_participant_scope(
         "allowed_read_roots": [view_root + "/inputs"],
         "allowed_write_roots": [view_root + "/outputs", receipt_root],
     }
+    security_mode = access_scope.get("security_mode", "strict")
+    if security_mode not in {"normal", "strict"}:
+        raise _error("access_scope security_mode is invalid", E_SCHEMA)
     for field, expected in expected_scope.items():
         if access_scope.get(field) != expected:
             raise _error("access_scope %s does not match the participant view" % field, E_SCHEMA, field=field)
     if access_scope.get("requires_platform_enforcement") is not True:
         raise _error("access_scope must require platform enforcement", E_SCHEMA)
-    if access_scope.get("independence_claim_requires_enforcement_receipt") is not True:
+    if access_scope.get("independence_claim_requires_enforcement_receipt") is not (security_mode == "strict"):
         raise _error("access_scope must require enforcement evidence for independence claims", E_SCHEMA)
     manifest_hash = access_scope.get("input_manifest_sha256")
     scope_digest = access_scope.get("scope_digest")
@@ -227,7 +230,14 @@ def _validate_participant_scope(
         "respond": view_root + "/outputs/交叉回应文档.md",
     }
     expected_output = expected_outputs.get(kind, receipt_root)
-    if output_path.rstrip("/") != expected_output:
+    response_round_path = (
+        kind == "respond"
+        and re.fullmatch(
+            rf"{re.escape(view_root)}/outputs/round-[1-9][0-9]*/交叉回应文档\.md",
+            output_path.rstrip("/"),
+        )
+    )
+    if output_path.rstrip("/") != expected_output and not response_round_path:
         raise _error("output path is outside the participant write scope", E_PATH_SCOPE, path=output_path, agent_id=agent_id)
 
 

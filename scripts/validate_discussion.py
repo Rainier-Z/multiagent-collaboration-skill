@@ -37,7 +37,7 @@ SHANGHAI = "Asia/Shanghai"
 # 封闭枚举（references/state-schema.md 第二、三、五节）
 PHASES = [
     "initialized", "independent_proposal", "proposals_complete",
-    "cross_response", "candidate_decision", "user_confirmation",
+    "cross_response", "candidate_decision", "human_review", "finalizing", "user_confirmation",
     "confirmed_decision", "delivered", "monitoring_stopped",
 ]
 SUBMISSION_VALUES = ("pending", "submitted")
@@ -177,8 +177,11 @@ def collect_evidence_checks(state, discussion_dir):
 
     proposal_path = lambda pid: os.path.join(
         discussion_dir, ".multiagent", "views", pid, "outputs", "提案文档.md")
-    response_path = lambda pid: os.path.join(
-        discussion_dir, ".multiagent", "views", pid, "outputs", "交叉回应文档.md")
+    def response_path(pid):
+        output_root = os.path.join(discussion_dir, ".multiagent", "views", pid, "outputs")
+        if isinstance(state.get("coordinator_participant"), dict) and int(state.get("round", 0) or 0) > 0:
+            return os.path.join(output_root, "round-%d" % int(state["round"]), "交叉回应文档.md")
+        return os.path.join(output_root, "交叉回应文档.md")
     discussion_doc_exists = bool(glob.glob(
         os.path.join(discussion_dir, DISCUSSION_DOC_GLOB)))
 
@@ -202,7 +205,7 @@ def collect_evidence_checks(state, discussion_dir):
             if response_status.get(pid) == "submitted":
                 add(exist(response_path(pid)),
                     "交叉回应文件存在: " + os.path.basename(response_path(pid)))
-    elif stage == "candidate_decision":
+    elif stage in {"candidate_decision", "human_review", "finalizing"}:
         add(discussion_doc_exists, "主讨论文档存在（合并产物）")
         add(bool(state["candidate_decision_ids"]),
             "候选决策 ID 已登记（candidate_decision_ids 非空）")

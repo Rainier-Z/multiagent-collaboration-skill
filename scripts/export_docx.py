@@ -55,6 +55,8 @@ STAGES = [
     "initialized",
     "independent_proposal",
     "cross_response",
+    "human_review",
+    "finalizing",
     "candidate_decision",
     "user_confirmation",
     "confirmed_decision",

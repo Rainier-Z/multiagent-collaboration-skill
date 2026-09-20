@@ -18,16 +18,18 @@
 
 ```text
 WakeRequest(workspace, agent_id, platform_id, session_id, instruction_id, runtime_version)
-→ WakeResult(status, detail, evidence)
+→ ActivationResult(status, detail, evidence)
 ```
 
-WakeRequest 只携带定位字段，不允许携带提案、回应、讨论正文、task_prompt、私密推理、凭据或其他参与者输入。完整 task_prompt 必须写在工作区不可变指令中；收到唤醒的参与者需要读取原始指令后执行。WakeResult.status 只能是：
+WakeRequest 只携带定位字段，不允许携带提案、回应、讨论正文、task_prompt、私密推理、凭据或其他参与者输入。完整 task_prompt 必须写在工作区不可变指令中；收到唤醒的参与者需要读取原始指令后执行。ActivationResult.status 只能是以下三态：
 
 | 值 | 含义 | 后续动作 |
 |---|---|---|
-| `accepted` | 外部平台已接收最小 handoff 请求 | 等待参与者工作区回执；不可据此认定完成 |
-| `unavailable` | 没有已验证且已配置的外部唤醒入口 | 记录 `E_PLATFORM_UNAVAILABLE`，要求一次人工启动 |
-| `rejected` | 平台明确拒绝这次 handoff | 记录拒绝证据，不假装重试成功 |
+| `activated` | 已验证的外部平台 dispatcher 接受最小 handoff 请求 | 等待参与者工作区回执；不可据此认定完成 |
+| `manual_activation_required` | 没有已验证且已配置的外部激活入口 | 记录 `E_PLATFORM_UNAVAILABLE`，要求 Rainier 显式启动 |
+| `activation_failed` | 已尝试激活但平台明确拒绝或调用失败 | 记录失败证据，不假装重试成功 |
+
+兼容旧编排器的 `WakeAdapter.wake()` 仍可返回 `WakeResult(accepted/unavailable/rejected)`；其映射为 `activated/manual_activation_required/activation_failed`。新调用方应使用平台适配器的 `activate()`，而不是把兼容状态当作执行完成。后台文件扫描永远不会生成 `activated`。
 
 适配器默认不能调用未配置的 API、终端或会话。它们不保存 API Key、Token、密码或内部配置。
 
@@ -39,9 +41,9 @@ WakeRequest 只携带定位字段，不允许携带提案、回应、讨论正�
 | Codex | `CodexWakeAdapter()` | 未配置即 `unavailable`；已设计、未验证 |
 | OpenClaw | `OpenClawWakeAdapter()` | 未配置即 `unavailable`；已设计、未验证 |
 
-平台身份与会话路由由初始化时显式绑定，不能从平台名称、账号或当前进程推断。accepted 只表示平台接受了定位请求；实际执行以目标 agent_id 对应会话写入的有效回执和产物为准。没有经过验证的原生入口时，记录阻塞，或由 Rainier 显式激活一次。
+平台身份与会话路由由初始化时显式绑定，不能从平台名称、账号或当前进程推断。`activated` 只表示平台接受了定位请求；实际执行以目标 agent_id 对应会话写入的有效回执和产物为准。没有经过验证的原生入口时，返回 `manual_activation_required`，或在投递失败时返回 `activation_failed`。
 
-可以向任一适配器显式注入经验证的 dispatcher。只有在保存了独立端到端证据后，才允许 dispatcher 返回 `accepted`。该状态仅表示投递成功，仍必须由 Runtime 的 `accepted`、`completed` 或 `failed` 回执证明实际执行。
+可以向任一适配器显式注入经验证的 dispatcher。只有在保存了独立端到端证据后，才允许 dispatcher 返回 `activated`（旧 `WakeResult("accepted")` 会被兼容映射）。该状态仅表示投递成功，仍必须由 Runtime 的 `accepted`、`completed` 或 `failed` 回执证明实际执行。
 
 ### 1. OpenClaw 的原生 Automation 义务
 
@@ -57,7 +59,9 @@ OpenClaw 参与者支持以其原生 Automation/cron 进行项目级轮询，但
 
 `operational_directive` 只能解释或执行已下发的指令；不得自行生成下一条指令、修改 `state.json`、争夺协调权或把后台扫描视为完成证据。使用 `session=current` 的任务仅适合端到端演习：它绑定创建时会话，不能单独证明长期稳定的身份或投递路由。长期运行须显式验证会话/频道路由与运行历史。
 
-即使 OpenClaw 已成功建立原生 Automation，`OpenClawWakeAdapter()` 仍默认返回 `unavailable`，直到独立验证“协调者最小 handoff → 正确 OpenClaw 会话 → 读取工作区原始指令 → 有效回执 → 可见运行记录”的端到端链路。原生轮询不能被表述为协调者已具备 direct wake。
+即使 OpenClaw 已成功建立原生 Automation，`OpenClawWakeAdapter().activate()` 仍默认返回 `manual_activation_required`，直到独立验证“协调者最小 handoff → 正确 OpenClaw 会话 → 读取工作区原始指令 → 有效回执 → 可见运行记录”的端到端链路。原生轮询不能被表述为协调者已具备 direct wake，也不能把扫描结果当成 `activated`。
+
+> 新协议覆盖说明：上述 stop 证明门禁适用于正式结论发布后的 `finalizing` 阶段；候选 Word 审阅期间保持监测，旧工作区才使用 `user_confirmation` 兼容路径。
 
 ## （五）验证门槛
 
@@ -66,7 +70,7 @@ OpenClaw 参与者支持以其原生 Automation/cron 进行项目级轮询，但
 1. 平台接收的内容只有最小 `WakeRequest` 定位字段。
 2. 被唤醒会话读取共享工作区的指定指令，而不是聊天消息中的正文。
 3. 会话写出了属于自身目录、时序正确且哈希有效的回执。
-4. 未配置或失败时产生 `unavailable`/`rejected`，不会制造成功回执或推进阶段。
+4. 未配置或失败时产生 `manual_activation_required`/`activation_failed`，不会制造成功回执或推进阶段。
 5. 重复投递同一指令不造成重复产物或额外状态修订。
 6. 独立阶段使用密封输入视图、平台强制沙箱与精确读写白名单，并保留访问执行证据；普通同一 Windows 用户 ACL 或提示词声明不足以证明严格独立。
 

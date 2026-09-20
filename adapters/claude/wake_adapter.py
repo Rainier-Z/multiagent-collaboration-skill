@@ -11,19 +11,45 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from adapters.common.wake_protocol import WakeRequest, WakeResult, unavailable
+from adapters.common.wake_protocol import (
+    ActivationResult,
+    WakeRequest,
+    WakeResult,
+    activation_failed,
+    manual_activation_required,
+    unavailable,
+)
 
 
 class ClaudeCodeWakeAdapter:
     platform = "Claude Code"
 
-    def __init__(self, dispatcher: Callable[[WakeRequest], WakeResult] | None = None) -> None:
+    def __init__(self, dispatcher: Callable[[WakeRequest], ActivationResult | WakeResult] | None = None) -> None:
         self._dispatcher = dispatcher
 
-    def wake(self, request: WakeRequest) -> WakeResult:
+    def activate(self, request: WakeRequest) -> ActivationResult:
+        """Attempt explicit activation; a scanner is never a dispatcher."""
         if self._dispatcher is None:
-            return unavailable(self.platform)
-        result = self._dispatcher(request)
-        if not isinstance(result, WakeResult):
-            return WakeResult("rejected", "verified dispatcher returned an invalid result")
-        return result
+            return manual_activation_required(self.platform)
+        try:
+            result = self._dispatcher(request)
+        except Exception as exc:
+            return activation_failed(self.platform, f"dispatcher raised {type(exc).__name__}")
+        if isinstance(result, ActivationResult):
+            return result
+        if isinstance(result, WakeResult):
+            mapped = {
+                "accepted": ActivationResult("activated", result.detail, result.evidence),
+                "unavailable": manual_activation_required(self.platform, result.detail),
+                "rejected": activation_failed(self.platform, result.detail),
+            }
+            return mapped[result.status]
+        return activation_failed(self.platform, "dispatcher returned an invalid result")
+
+    def wake(self, request: WakeRequest) -> WakeResult:
+        result = self.activate(request)
+        if result.status == "activated":
+            return WakeResult("accepted", result.detail, result.evidence)
+        if result.status == "manual_activation_required":
+            return unavailable(self.platform, result.detail)
+        return WakeResult("rejected", result.detail, result.evidence)
