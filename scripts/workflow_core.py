@@ -47,6 +47,7 @@ E_PLATFORM_UNAVAILABLE = "E_PLATFORM_UNAVAILABLE"
 E_SEMANTIC_DECISION = "E_SEMANTIC_DECISION"
 E_COORDINATOR_BINDING = "E_COORDINATOR_BINDING"
 E_ISOLATION_UNVERIFIED = "E_ISOLATION_UNVERIFIED"
+E_RECEIPT_UNREADABLE = "E_RECEIPT_UNREADABLE"
 
 VALID_STAGES = {
     "initialized", "independent_proposal", "proposals_complete",
@@ -193,13 +194,71 @@ def normalize_participants(values: Iterable[str], *, lowercase: bool = False) ->
 
 
 class StateLock(AbstractContextManager["StateLock"]):
-    """基于原子目录创建的跨进程锁，退出时只清理自己创建的锁。"""
+    """基于原子目录创建的跨进程锁，支持安全回收死进程遗留锁。"""
 
     def __init__(self, workspace: str | Path, timeout_seconds: float = 5.0) -> None:
         self.workspace = Path(workspace).resolve()
         self.path = self.workspace / ".multiagent" / ".state.lock"
         self.timeout_seconds = timeout_seconds
         self.acquired = False
+        self.owner_token = uuid.uuid4().hex
+
+    @staticmethod
+    def _pid_alive(pid: Any) -> bool:
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError as exc:
+            # Windows reports a non-existent PID as ERROR_INVALID_PARAMETER
+            # (87) or ERROR_INVALID_HANDLE (6), rather than ProcessLookupError.
+            # POSIX may use ESRCH (3) for the same condition.
+            if getattr(exc, "winerror", None) in {6, 87} or getattr(exc, "errno", None) in {3, 22}:
+                return False
+            return True
+        return True
+
+    @staticmethod
+    def _process_start_time(pid: int) -> str | None:
+        """Return a best-effort OS process start marker without dependencies."""
+        if os.name != "posix":
+            return None
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            # Field 22 (starttime) follows the comm field, which may contain
+            # spaces; split only after its final closing parenthesis.
+            tail = stat.rsplit(")", 1)[1].split()
+            return tail[19] if len(tail) > 19 else None
+        except (OSError, IndexError):
+            return None
+
+    def _reclaim_stale_lock(self) -> bool:
+        """Atomically quarantine a lock whose recorded owner has exited."""
+        owner_path = self.path / "owner.json"
+        try:
+            owner = load_json(owner_path)
+        except (WorkflowError, OSError):
+            return False
+        if self._pid_alive(owner.get("pid")):
+            return False
+        quarantine = self.path.parent / (".state.lock.reclaim-" + uuid.uuid4().hex)
+        try:
+            os.rename(self.path, quarantine)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        try:
+            shutil.rmtree(quarantine, ignore_errors=False)
+        except OSError:
+            # The lock has already been detached from the live lock name. It
+            # is safe for a later cleanup pass to remove the quarantine.
+            return True
+        return True
 
     def __enter__(self) -> "StateLock":
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -208,19 +267,34 @@ class StateLock(AbstractContextManager["StateLock"]):
         while True:
             try:
                 os.mkdir(self.path)
+                atomic_write_json(self.path / "owner.json", {
+                    "pid": os.getpid(),
+                    "owner_token": self.owner_token,
+                    "acquired_at": iso_now(),
+                    "process_start_time": self._process_start_time(os.getpid()),
+                })
                 self.acquired = True
-                atomic_write_json(self.path / "owner.json", {"pid": os.getpid(), "acquired_at": iso_now()})
                 return self
             except FileExistsError:
+                if self._reclaim_stale_lock():
+                    continue
                 if time.monotonic() >= deadline:
                     raise WorkflowError("状态正被另一动作占用", E_STATE_CONFLICT, lock_path=str(self.path))
                 time.sleep(0.05)
+            except Exception:
+                shutil.rmtree(self.path, ignore_errors=True)
+                raise
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         if self.acquired:
             try:
-                (self.path / "owner.json").unlink(missing_ok=True)
-                self.path.rmdir()
+                try:
+                    owner = load_json(self.path / "owner.json")
+                except (WorkflowError, OSError):
+                    owner = {}
+                if owner.get("owner_token") == self.owner_token:
+                    (self.path / "owner.json").unlink(missing_ok=True)
+                    self.path.rmdir()
             finally:
                 self.acquired = False
         return None

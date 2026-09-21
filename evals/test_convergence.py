@@ -17,11 +17,85 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from convergence import (  # type: ignore[import-not-found]
     AgentResponse,
+    ConvergenceAssessment,
     ConvergenceEvaluator,
+    ConvergenceSchemaError,
     build_three_fake_agents,
     evaluate_convergence,
     run_fake_agent_lifecycle,
+    validate_convergence_assessment,
 )
+
+
+def modern_assessment(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "round": 2,
+        "new_substantive_issues": ["暂无"],
+        "unanswered_arguments": ["没有"],
+        "new_evidence": ["N/A"],
+        "remaining_disagreements": ["-"],
+        "positions": {"agent-a": ["bounded rollout"], "agent-b": ["bounded rollout"]},
+        "value_conflicts": ["无"],
+        "more_discussion": False,
+        "requires_human_decision": True,
+        "converged": True,
+        "reason": "暂无",
+    }
+    payload.update(overrides)
+    return payload
+
+
+class ModernConvergenceSchemaTests(unittest.TestCase):
+    def test_gate_normalizes_no_content_but_preserves_explicit_semantic_booleans(self) -> None:
+        assessment = ConvergenceAssessment.from_mapping(
+            modern_assessment(),
+            participant_ids=("agent-a", "agent-b", "agent-c"),
+        )
+
+        self.assertEqual(assessment.new_substantive_issues, ())
+        self.assertEqual(assessment.unanswered_arguments, ())
+        self.assertEqual(assessment.new_evidence, ())
+        self.assertEqual(assessment.remaining_disagreements, ())
+        self.assertEqual(assessment.value_conflicts, ())
+        self.assertEqual(assessment.reason, "")
+        self.assertTrue(assessment.converged)
+        self.assertTrue(assessment.requires_human_decision)
+        self.assertFalse(assessment.more_discussion)
+
+    def test_gate_rejects_unknown_participant_reference(self) -> None:
+        with self.assertRaises(ConvergenceSchemaError):
+            validate_convergence_assessment(
+                modern_assessment(positions={"agent-x": ["unknown"]}),
+                participant_ids=("agent-a", "agent-b", "agent-c"),
+            )
+
+    def test_gate_rejects_missing_fields_and_wrong_boolean_types(self) -> None:
+        missing = modern_assessment()
+        del missing["reason"]
+        with self.assertRaises(ConvergenceSchemaError):
+            validate_convergence_assessment(missing)
+        with self.assertRaises(ConvergenceSchemaError):
+            validate_convergence_assessment(modern_assessment(converged="yes"))
+
+    def test_gate_does_not_infer_convergence_from_empty_content(self) -> None:
+        result = validate_convergence_assessment(
+            modern_assessment(
+                converged=False,
+                requires_human_decision=False,
+                more_discussion=True,
+                reason="无新信息，但协调者要求继续",
+            )
+        )
+        self.assertFalse(result["converged"])
+        self.assertFalse(result["requires_human_decision"])
+        self.assertTrue(result["more_discussion"])
+
+    def test_gate_accepts_early_long_form_more_discussion_alias(self) -> None:
+        payload = modern_assessment()
+        del payload["more_discussion"]
+        payload["would_more_discussion_add_information"] = False
+        result = validate_convergence_assessment(payload)
+        self.assertFalse(result["more_discussion"])
 
 
 class ConvergenceEvaluatorTests(unittest.TestCase):

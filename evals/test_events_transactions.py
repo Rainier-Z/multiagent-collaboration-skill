@@ -21,6 +21,7 @@ from events import EventStream, EventStreamError  # type: ignore[import-not-foun
 from transactions import (  # type: ignore[import-not-found]
     TransactionRecoveryError,
     commit_transaction,
+    commit_round_transition,
     recover_transactions,
 )
 
@@ -117,6 +118,37 @@ class EventTransactionTests(unittest.TestCase):
         EventStream(self.workspace).path.unlink()
         with self.assertRaises(TransactionRecoveryError):
             recover_transactions(self.workspace)
+
+    def test_transaction_deletes_files_and_records_deleted_paths(self) -> None:
+        old = self.workspace / "round-0.md"
+        old.write_text("old", encoding="utf-8")
+        result = commit_transaction(
+            self.workspace,
+            event_type="round.completed",
+            artifacts={"round-1.md": "new"},
+            deletions=["round-0.md"],
+            state_update={"round": 1},
+            expected_revision=1,
+        )
+        self.assertEqual(result["status"], "committed")
+        self.assertFalse(old.exists())
+        event = EventStream(self.workspace).read()[0]
+        self.assertEqual(event["payload"]["deleted_paths"], ["round-0.md"])
+
+    def test_round_transition_is_one_recoverable_operation(self) -> None:
+        result = commit_round_transition(
+            self.workspace,
+            round_number=1,
+            snapshot_path=".multiagent/rounds/round-1.md",
+            snapshot="# Round 1\n",
+            next_round_instructions={".multiagent/instructions/a/round-1.json": {"round": 1}},
+            state_update={"round": 1, "stage": "cross_response"},
+            expected_revision=1,
+        )
+        self.assertEqual(result["event"]["event_type"], "round.completed")
+        self.assertEqual(result["state_revision"], 2)
+        self.assertTrue((self.workspace / ".multiagent/rounds/round-1.md").is_file())
+        self.assertTrue((self.workspace / ".multiagent/instructions/a/round-1.json").is_file())
 
 
 if __name__ == "__main__":

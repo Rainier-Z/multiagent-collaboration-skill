@@ -24,22 +24,31 @@ if str(REPO_ROOT) not in sys.path:
 
 from adapters.common.wake_protocol import WakeAdapter, WakeRequest, WakeResult
 from workflow_core import (
-    E_OUTPUT_FORMAT, E_PLATFORM_UNAVAILABLE, E_RETRY_EXHAUSTED, E_SCHEMA,
+    E_OUTPUT_FORMAT, E_PLATFORM_UNAVAILABLE, E_RETRY_EXHAUSTED, E_SCHEMA, E_STATE_CONFLICT,
+    E_RECEIPT_UNREADABLE,
     StateLock, WorkflowError, atomic_write_json, atomic_write_text,
     ensure_content_consistency, load_json, load_state, main_markdown_path,
     path_in_workspace, sha256_file, update_content_hash,
     validate_coordinator_execution, validate_state_shape,
 )
 from events import EventStream
-from transactions import EventTransaction, recover_transactions
-from convergence import AgentResponse, ConvergenceEvaluator
+from transactions import EventTransaction, commit_transaction, recover_transactions
+from transactions import commit_round_transition
+from convergence import AgentResponse, ConvergenceEvaluator, validate_convergence_assessment, ConvergenceSchemaError
 from participant_runtime.protocol import (
     Instruction, Receipt, instruction_path, isolation_evidence_path, load_isolation_evidence,
     load_stop_attestation,
     receipt_path, validate_input_manifest, write_instruction,
 )
 from instruction_prompts import build_task_prompt
-from participant_views import access_scope as sealed_access_scope, output_path as sealed_output_path, publish_inputs
+from participant_views import (
+    access_scope as sealed_access_scope,
+    access_scope_for_manifest,
+    output_path as sealed_output_path,
+    prepare_inputs,
+    publish_inputs,
+    PreparedInputs,
+)
 import export_docx
 from openclaw_automation import render_openclaw_operational_directive
 
@@ -110,12 +119,22 @@ def _read_receipts(workspace: Path) -> list[dict[str, Any]]:
     for path in sorted(root.rglob("*.json")):
         try:
             value = load_json(path)
-        except Exception:
-            continue
+        except Exception as exc:
+            raise WorkflowError(
+                "receipt JSON 无法解析，流程已 fail-closed",
+                E_RECEIPT_UNREADABLE,
+                path=str(path),
+            ) from exc
         if isinstance(value, dict):
             value = dict(value)
             value["_path"] = path
             records.append(value)
+        else:
+            raise WorkflowError(
+                "receipt JSON 顶层必须是对象，流程已 fail-closed",
+                E_RECEIPT_UNREADABLE,
+                path=str(path),
+            )
     return records
 
 
@@ -227,6 +246,7 @@ def _new_instruction(
     origin_instruction_id: str | None = None,
     root_instruction_id: str | None = None,
     failure_receipt: dict[str, Any] | None = None,
+    prepared_inputs: PreparedInputs | None = None,
 ) -> Instruction:
     counter = int(state.get("instruction_sequence", 0)) + 1
     state["instruction_sequence"] = counter
@@ -240,7 +260,7 @@ def _new_instruction(
         manifest = workspace / ".multiagent" / "runtime" / "participant" / runtime_version / "manifest.json"
         if manifest.is_file():
             input_sources.append((manifest, "runtime-manifest.json"))
-    if kind == "respond":
+    if kind in {"respond", "final_ack"}:
         discussion = _main_markdown(workspace)
         if discussion is not None:
             input_sources.append((discussion, "discussion.md"))
@@ -266,7 +286,17 @@ def _new_instruction(
     binding = _participant_binding(state, agent_id)
     # Even instructions with no source files (notably stop) need an explicit
     # empty immutable manifest so the Runtime can verify the exact artifact scope.
-    inputs = publish_inputs(workspace, agent_id, input_sources, instruction_kind=kind)
+    if prepared_inputs is None:
+        inputs = publish_inputs(workspace, agent_id, input_sources, instruction_kind=kind)
+        scope = sealed_access_scope(workspace, agent_id)
+        input_artifacts: dict[str, bytes] = {}
+    else:
+        inputs = list(prepared_inputs.published)
+        scope = access_scope_for_manifest(
+            workspace, agent_id, prepared_inputs.manifest_relative,
+            prepared_inputs.manifest_sha256, prepared_inputs.scope_digest,
+        )
+        input_artifacts = dict(prepared_inputs.artifacts)
     if output_path is None:
         output_path = sealed_output_path(workspace, agent_id, kind)
     if kind == "respond" and round_number is not None:
@@ -274,7 +304,6 @@ def _new_instruction(
             workspace / ".multiagent" / "views" / agent_id / "outputs"
             / ("round-%d" % round_number) / "交叉回应文档.md"
         ).relative_to(workspace).as_posix()
-    scope = sealed_access_scope(workspace, agent_id)
     payload: dict[str, Any] = {
         "instruction_id": "I-%06d" % counter,
         "discussion_id": state["discussion_id"],
@@ -321,7 +350,12 @@ def _new_instruction(
         payload["task_prompt"] += "\n\n当前交叉回应轮次：%d。只回应本轮输入快照，不得覆盖其他轮次产物。" % round_number
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     payload["sha256"] = hashlib.sha256(canonical).hexdigest()
-    return Instruction.from_dict(payload)
+    instruction = Instruction.from_dict(payload)
+    # The attribute is intentionally private and consumed only by the round
+    # transition planner; ordinary _issue continues to publish immediately.
+    if input_artifacts:
+        object.__setattr__(instruction, "_prepared_artifacts", input_artifacts)
+    return instruction
 
 
 def _participant_binding(state: dict[str, Any], agent_id: str) -> dict[str, str]:
@@ -364,6 +398,37 @@ def _record_wake(workspace: Path, request: WakeRequest, result: WakeResult) -> N
         atomic_write_json(path, store)
 
 
+def _modern_instruction_event(
+    workspace: Path,
+    state: dict[str, Any],
+    instruction: Instruction,
+    *,
+    activation_status: str = "pending_monitor",
+) -> None:
+    """Publish an instruction event without activating a participant.
+
+    Modern workspaces separate the coordinator (publisher) from the
+    participant monitor (activation bridge).  The coordinator may append the
+    durable event, but must never call a platform wake adapter here.
+    """
+    event_id = "instruction-%s" % instruction.instruction_id
+    if any(isinstance(event, dict) and event.get("event_id") == event_id for event in EventStream(workspace).read()):
+        return
+    EventStream(workspace).append(
+        "instruction_issued",
+        {
+            "agent_id": instruction.agent_id,
+            "instruction_id": instruction.instruction_id,
+            "kind": instruction.kind,
+            "activation_status": activation_status,
+        },
+        transaction_id="instruction-%s" % instruction.instruction_id,
+        revision_before=int(state.get("revision", 0)),
+        revision_after=int(state.get("revision", 0)),
+        event_id=event_id,
+    )
+
+
 def _load_wake_event_store(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"schema_version": "1.0", "events": []}
@@ -382,6 +447,14 @@ def _wake_existing(workspace: Path, state: dict[str, Any], wake: WakeAdapter, re
     """Deliver an initialization-published instruction once, without rewriting it."""
     audit = workspace / ".multiagent" / "audit" / "wake-events.json"
     events = _load_wake_event_store(audit)["events"]
+    if _round_lifecycle(state):
+        if not any(
+            isinstance(event, dict)
+            and event.get("event_id") == "instruction-%s" % instruction.instruction_id
+            for event in EventStream(workspace).read()
+        ):
+            _modern_instruction_event(workspace, state, instruction)
+        return
     if any(isinstance(event, dict) and event.get("instruction_id") == instruction.instruction_id for event in events):
         return
     binding = _participant_binding(state, agent_id)
@@ -435,6 +508,9 @@ def _issue(
     )
     write_instruction(workspace, instruction)
     result.issued_instruction_ids.append(instruction.instruction_id)
+    if _round_lifecycle(state):
+        _modern_instruction_event(workspace, state, instruction)
+        return
     binding = _participant_binding(state, agent_id)
     request = WakeRequest(workspace, agent_id, instruction.instruction_id, instruction.runtime_version,
                           binding["platform_id"], binding["session_id"])
@@ -455,6 +531,272 @@ def _issue(
     )
     if wake_result.status != "accepted" and E_PLATFORM_UNAVAILABLE not in result.blocking_error_codes:
         result.blocking_error_codes.append(E_PLATFORM_UNAVAILABLE)
+
+
+def _instruction_artifacts(workspace: Path, instruction: Instruction) -> dict[str, bytes]:
+    """Serialize an already validated instruction for a transaction."""
+    path = instruction_path(workspace, instruction.agent_id, instruction)
+    return {path.relative_to(workspace).as_posix(): json.dumps(
+        instruction.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")}
+
+
+def _round_snapshot(
+    workspace: Path,
+    receipts: list[dict[str, Any]],
+    participants: list[str],
+    round_number: int,
+) -> tuple[str, bytes, str]:
+    """Build the immutable public snapshot for one completed response round."""
+    lines = [
+        "# Public Round Snapshot %d" % round_number,
+        "",
+        "本文件是第 %d 轮交叉回应完成后的公共快照。后续轮次只能读取本快照，不得直接读取其他参与者私有输出。" % round_number,
+        "",
+    ]
+    for agent in participants:
+        records = [
+            record for record in receipts
+            if record.get("agent_id") == agent
+            and record.get("kind") == "respond"
+            and record.get("status") == "completed"
+            and _response_round(workspace, record) == round_number
+        ]
+        if not records:
+            raise WorkflowError("缺少 round response receipt", E_SCHEMA, agent_id=agent, round=round_number)
+        record = records[-1]
+        output = path_in_workspace(workspace, str(record.get("output_path", "")))
+        if not output.is_file():
+            raise WorkflowError("round response output missing", E_SCHEMA, agent_id=agent, round=round_number)
+        text = output.read_text(encoding="utf-8").strip()
+        lines.extend([
+            "## %s" % agent,
+            "",
+            "> 来源 SHA-256：`%s`" % sha256_file(output),
+            "",
+            text,
+            "",
+        ])
+    content = ("\n".join(lines).rstrip() + "\n").encode("utf-8")
+    relative = ".multiagent/rounds/round-%d.md" % round_number
+    return relative, content, hashlib.sha256(content).hexdigest()
+
+
+def _validate_round_snapshots(workspace: Path, state: dict[str, Any]) -> None:
+    """Fail closed if any sealed public round snapshot changed on disk."""
+    rounds = state.get("rounds")
+    if not isinstance(rounds, dict):
+        return
+    for key, metadata in rounds.items():
+        if not isinstance(metadata, dict):
+            raise WorkflowError("round metadata is malformed", E_SCHEMA, round=key)
+        path_value = metadata.get("snapshot_path")
+        expected = metadata.get("snapshot_sha256")
+        if not isinstance(path_value, str) or not isinstance(expected, str):
+            raise WorkflowError("round metadata lacks immutable snapshot binding", E_SCHEMA, round=key)
+        snapshot = path_in_workspace(workspace, path_value)
+        if not snapshot.is_file() or sha256_file(snapshot) != expected:
+            raise WorkflowError("round snapshot hash mismatch", E_STATE_CONFLICT, round=key, path=path_value)
+        assessment_value = metadata.get("assessment_path")
+        assessment_hash = metadata.get("assessment_sha256")
+        if assessment_value is not None or assessment_hash is not None:
+            if not isinstance(assessment_value, str) or not isinstance(assessment_hash, str):
+                raise WorkflowError("round convergence assessment binding is malformed", E_SCHEMA, round=key)
+            assessment = path_in_workspace(workspace, assessment_value)
+            if not assessment.is_file() or sha256_file(assessment) != assessment_hash:
+                raise WorkflowError("round convergence assessment hash mismatch", E_STATE_CONFLICT, round=key, path=assessment_value)
+
+
+def _publish_round_snapshot(
+    workspace: Path,
+    state: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    participants: list[str],
+    current_round: int,
+    *,
+    expected_revision: int,
+) -> dict[str, Any]:
+    """Publish the immutable public snapshot as the first round transition.
+
+    A completed response round has two durable phases.  This phase publishes
+    only the public snapshot and its state binding.  The coordinator must then
+    read that snapshot and write the semantic assessment before the next-round
+    transition is allowed.  Keeping these commits separate prevents a
+    pre-existing assessment from making it appear as though a snapshot had
+    already been published and reviewed.
+    """
+    snapshot_relative, snapshot_data, snapshot_sha256 = _round_snapshot(
+        workspace, receipts, participants, current_round,
+    )
+    snapshot_path = path_in_workspace(workspace, snapshot_relative)
+    if snapshot_path.exists() and snapshot_path.read_bytes() != snapshot_data:
+        raise WorkflowError("round snapshot is immutable", E_STATE_CONFLICT, path=snapshot_relative)
+
+    rounds = dict(state.get("rounds") or {})
+    existing = rounds.get(str(current_round))
+    if isinstance(existing, dict):
+        existing_path = existing.get("snapshot_path")
+        existing_hash = existing.get("snapshot_sha256")
+        if existing_path != snapshot_relative or existing_hash != snapshot_sha256:
+            raise WorkflowError("round snapshot binding conflict", E_STATE_CONFLICT, round=current_round)
+        # The snapshot transaction was already committed.  Do not append a
+        # duplicate event or advance the revision on a retry.
+        return state
+
+    rounds[str(current_round)] = {
+        "round": current_round,
+        "snapshot_path": snapshot_relative,
+        "snapshot_sha256": snapshot_sha256,
+        "status": "snapshot_published",
+        "published_at": _now(),
+    }
+    state_update = dict(state)
+    state_update["rounds"] = rounds
+    commit_round_transition(
+        workspace,
+        round_number=current_round,
+        snapshot_path=snapshot_relative,
+        snapshot=snapshot_data,
+        event_payload={
+            "phase": "snapshot_published",
+            "snapshot_path": snapshot_relative,
+            "snapshot_sha256": snapshot_sha256,
+        },
+        expected_revision=expected_revision,
+        state_update=state_update,
+        event_type="round_snapshot_published",
+    )
+    state = dict(state_update)
+    state["revision"] = expected_revision + 1
+    return state
+
+
+def _round_transition(
+    workspace: Path,
+    state: dict[str, Any],
+    receipts: list[dict[str, Any]],
+    participants: list[str],
+    current_round: int,
+    convergence: dict[str, Any],
+    wake: WakeAdapter,
+    result: OrchestrationResult,
+    *,
+    expected_revision: int,
+) -> tuple[dict[str, Any], bool]:
+    """Atomically publish the next-round transition after assessment.
+
+    The immutable snapshot is published by :func:`_publish_round_snapshot` in
+    a prior transaction.  This second transaction is therefore the semantic
+    assessment gate: it seals the assessment binding, next-round inputs and
+    instructions, ``state.round``/round metadata and the ``round_completed``
+    event together. Wake delivery is deliberately performed only after commit
+    because it is an external side effect.
+    """
+    snapshot_relative, snapshot_data, snapshot_sha256 = _round_snapshot(
+        workspace, receipts, participants, current_round,
+    )
+    snapshot_path = path_in_workspace(workspace, snapshot_relative)
+    if snapshot_path.exists() and snapshot_path.read_bytes() != snapshot_data:
+        raise WorkflowError("round snapshot is immutable", E_STATE_CONFLICT, path=snapshot_relative)
+    rounds = dict(state.get("rounds") or {})
+    round_metadata = rounds.get(str(current_round))
+    if not isinstance(round_metadata, dict):
+        raise WorkflowError("round snapshot must be published before assessment", E_STATE_CONFLICT, round=current_round)
+    if round_metadata.get("snapshot_path") != snapshot_relative or round_metadata.get("snapshot_sha256") != snapshot_sha256:
+        raise WorkflowError("round snapshot binding conflict", E_STATE_CONFLICT, round=current_round)
+    if round_metadata.get("status") not in {"snapshot_published", "completed"}:
+        raise WorkflowError("round snapshot state is malformed", E_SCHEMA, round=current_round)
+    artifacts: dict[str, bytes] = {}
+    assessment_relative = ".multiagent/convergence/round-%d.json" % current_round
+    assessment_path = path_in_workspace(workspace, assessment_relative)
+    if not assessment_path.is_file():
+        raise WorkflowError("缺少 Coordinator 收敛评估 JSON", E_SCHEMA, path=assessment_relative, round=current_round)
+    assessment_data = assessment_path.read_bytes()
+    assessment_sha256 = hashlib.sha256(assessment_data).hexdigest()
+    artifacts[assessment_relative] = assessment_data
+    if round_metadata.get("status") == "completed":
+        if round_metadata.get("assessment_path") != assessment_relative or round_metadata.get("assessment_sha256") != assessment_sha256:
+            raise WorkflowError("round assessment binding conflict", E_STATE_CONFLICT, round=current_round)
+        # A coordinator crash may occur after this transaction commits but
+        # before the follow-up candidate materialization.  Treat the durable
+        # completed metadata as the source of truth and avoid duplicating the
+        # round event or next-round instructions on retry.
+        return state, round_metadata.get("next_round") is not None
+    next_round = None
+    instructions: list[Instruction] = []
+    configured_max = int((state.get("convergence") or {}).get("max_response_rounds", 3))
+    if not convergence.get("converged") and current_round < configured_max:
+        next_round = current_round + 1
+        snapshot_source = path_in_workspace(workspace, snapshot_relative)
+        for agent in participants:
+            prepared = prepare_inputs(
+                workspace,
+                agent,
+                [
+                    (workspace / "project-context.md", "project-context.md"),
+                    (snapshot_source, "round-%d.md" % current_round),
+                ],
+                instruction_kind="respond",
+                source_contents={snapshot_relative: snapshot_data},
+            )
+            instruction = _new_instruction(
+                state, workspace, agent, "respond", round_number=next_round,
+                prepared_inputs=prepared,
+            )
+            instructions.append(instruction)
+            artifacts.update(prepared.artifacts)
+            artifacts.update(_instruction_artifacts(workspace, instruction))
+
+    rounds[str(current_round)] = {
+        **round_metadata,
+        "round": current_round,
+        "snapshot_path": snapshot_relative,
+        "snapshot_sha256": snapshot_sha256,
+        "assessment_path": assessment_relative,
+        "assessment_sha256": assessment_sha256,
+        "status": "completed",
+        "completed_at": _now(),
+        "convergence": convergence,
+        "next_round": next_round,
+        "instruction_ids": [item.instruction_id for item in instructions],
+    }
+    state["rounds"] = rounds
+    state["convergence"] = {
+        **(state.get("convergence") if isinstance(state.get("convergence"), dict) else {}),
+        "last_result": convergence,
+        "evaluated_round": current_round,
+    }
+    if next_round is not None:
+        state["round"] = next_round
+        queue = {agent: list(values) for agent, values in (state.get("instruction_queue") or {}).items()}
+        for instruction in instructions:
+            queue.setdefault(instruction.agent_id, []).append(instruction.instruction_id)
+        state["instruction_queue"] = queue
+    commit_round_transition(
+        workspace,
+        round_number=current_round,
+        snapshot_path=snapshot_relative,
+        snapshot=snapshot_data,
+        next_round_instructions=artifacts,
+        event_payload={
+            "round": current_round,
+            "snapshot_path": snapshot_relative,
+            "snapshot_sha256": snapshot_sha256,
+            "next_round": next_round,
+            "instruction_ids": [item.instruction_id for item in instructions],
+        },
+        expected_revision=expected_revision,
+        state_update=state,
+        event_type="round_completed",
+    )
+    state["revision"] = expected_revision + 1
+    for instruction in instructions:
+        result.issued_instruction_ids.append(instruction.instruction_id)
+        if _round_lifecycle(state):
+            _modern_instruction_event(workspace, state, instruction)
+        else:
+            _wake_existing(workspace, state, wake, result, instruction.agent_id, instruction)
+    return state, next_round is not None
 
 
 def _find_instruction(workspace: Path, agent_id: str, instruction_id: str) -> Instruction | None:
@@ -517,6 +859,13 @@ def _append_section(path: Path, title: str, sections: list[tuple[str, str]]) -> 
     if not path or not path.is_file():
         raise WorkflowError("主讨论 Markdown 不存在", E_SCHEMA, path=str(path))
     content = path.read_text(encoding="utf-8")
+    updated = _append_section_text(content, title, sections)
+    if updated != content:
+        atomic_write_text(path, updated)
+
+
+def _append_section_text(content: str, title: str, sections: list[tuple[str, str]]) -> str:
+    """Pure counterpart of :func:`_append_section` for transactional writes."""
     matches = list(re.finditer(r"(?m)^" + re.escape(title) + r"\s*$", content))
     if len(matches) != 1:
         raise WorkflowError("权威讨论文档必须恰有一个规范章节标题", E_SCHEMA, heading=title, matches=len(matches))
@@ -532,9 +881,9 @@ def _append_section(path: Path, title: str, sections: list[tuple[str, str]]) -> 
             continue
         additions.append("### %s\n\n%s" % (name, text.strip()))
     if not additions:
-        return
+        return content
     replacement = content[:body_start] + "\n\n" + "\n\n".join(filter(None, (body, *additions))) + "\n\n" + content[body_end:].lstrip("\n")
-    atomic_write_text(path, replacement)
+    return replacement
 
 
 def _completed_output(receipts: list[dict[str, Any]], agent_id: str, kinds: set[str]) -> dict[str, Any] | None:
@@ -781,7 +1130,10 @@ def _ensure_stop_instructions(
         if existing:
             instruction = existing[agent]
             instruction_ids[agent] = instruction.instruction_id
-            _wake_existing(workspace, state, wake, result, agent, instruction)
+            if _round_lifecycle(state):
+                _modern_instruction_event(workspace, state, instruction)
+            else:
+                _wake_existing(workspace, state, wake, result, agent, instruction)
         elif _instruction_exists(workspace, agent, "stop"):
             if "E_STOP_INSTRUCTION" not in result.blocking_error_codes:
                 result.blocking_error_codes.append("E_STOP_INSTRUCTION")
@@ -795,6 +1147,201 @@ def _ensure_stop_instructions(
         state["monitoring"] = monitoring
         changed = True
     return changed
+
+
+def _final_ack_instructions(workspace: Path, participants: list[str]) -> dict[str, Instruction]:
+    """Load the unique final-decision acknowledgement instruction per agent."""
+    found: dict[str, Instruction] = {}
+    for agent in participants:
+        directory = _instruction_root(workspace) / agent
+        matches: list[Instruction] = []
+        for path in sorted(directory.glob("*.json")) if directory.is_dir() else []:
+            try:
+                instruction = Instruction.from_dict(load_json(path))
+            except Exception:
+                continue
+            if instruction.kind == "final_ack" and instruction.agent_id == agent:
+                matches.append(instruction)
+        if len(matches) == 1:
+            found[agent] = matches[0]
+    return found
+
+
+def _all_final_ack_receipts_completed(
+    workspace: Path,
+    receipts: list[dict[str, Any]],
+    participants: list[str],
+) -> bool:
+    """Require one completed final_ack bound to the issued instruction per agent."""
+    instructions = _final_ack_instructions(workspace, participants)
+    if len(instructions) != len(participants):
+        return False
+    for agent in participants:
+        instruction = instructions[agent]
+        matches = [
+            item for item in receipts
+            if item.get("agent_id") == agent
+            and item.get("instruction_id") == instruction.instruction_id
+            and item.get("kind") == "final_ack"
+            and item.get("status") == "completed"
+        ]
+        if len(matches) != 1:
+            return False
+        if instruction.access_scope.get("security_mode", "strict") == "strict":
+            try:
+                expected = load_isolation_evidence(workspace, instruction)
+            except Exception:
+                return False
+            if matches[0].get("isolation_evidence") != expected:
+                return False
+    return True
+
+
+def _ensure_final_ack_instructions(
+    workspace: Path,
+    state: dict[str, Any],
+    wake: WakeAdapter,
+    result: OrchestrationResult,
+    participants: list[str],
+) -> bool:
+    """Publish final_decision acknowledgement instructions exactly once."""
+    changed = False
+    issued: dict[str, str] = dict(state.get("final_ack_instruction_ids") or {})
+    for agent in participants:
+        existing = _final_ack_instructions(workspace, [agent])
+        if existing:
+            issued[agent] = existing[agent].instruction_id
+            if _round_lifecycle(state):
+                _modern_instruction_event(workspace, state, existing[agent])
+            else:
+                _wake_existing(workspace, state, wake, result, agent, existing[agent])
+            continue
+        if _instruction_exists(workspace, agent, "final_ack"):
+            continue
+        before = len(result.issued_instruction_ids)
+        _issue(workspace, state, wake, result, agent, "final_ack")
+        if len(result.issued_instruction_ids) > before:
+            issued[agent] = result.issued_instruction_ids[-1]
+        changed = True
+    if issued != state.get("final_ack_instruction_ids"):
+        state["final_ack_instruction_ids"] = issued
+        changed = True
+    return changed
+
+
+def _proposal_transition(
+    workspace: Path,
+    state: dict[str, Any],
+    participants: list[str],
+    wake: WakeAdapter,
+    result: OrchestrationResult,
+    *,
+    expected_revision: int,
+) -> dict[str, Any]:
+    """Atomically merge proposals and publish round-one responses.
+
+    Modern workspaces must not expose a partially merged Markdown, a deleted
+    proposal, or an instruction whose state transition was never committed.
+    All visible files therefore go through one EventTransaction. Activation
+    events are appended only after the transaction has committed.
+    """
+    document = _main_markdown(workspace)
+    if document is None:
+        raise WorkflowError("主讨论 Markdown 不存在", E_SCHEMA)
+    content = document.read_text(encoding="utf-8")
+    sections: list[tuple[str, str]] = []
+    manifest_entries: list[dict[str, Any]] = []
+    proposal_paths: list[str] = []
+    for agent in participants:
+        path = _participant_output_path(workspace, agent, "proposals")
+        if not path.is_file():
+            raise WorkflowError("proposal output missing", E_SCHEMA, agent_id=agent)
+        data = path.read_bytes()
+        text = data.decode("utf-8").strip()
+        relative = path.relative_to(workspace).as_posix()
+        sections.append((agent, "> 来源 SHA-256：`%s`\n\n%s" % (hashlib.sha256(data).hexdigest(), text)))
+        proposal_paths.append(relative)
+        manifest_entries.append({
+            "path": relative,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "merged_revision": expected_revision + 1,
+            "disposed_at": _now(),
+        })
+    merged_content = _append_section_text(content, "## 二、独立提案", sections).encode("utf-8")
+
+    disposition = state.get("proposal_disposition", "archive")
+    manifest_path = ".multiagent/archive/proposals/manifest.json"
+    manifest_file = path_in_workspace(workspace, manifest_path)
+    existing: list[dict[str, Any]] = []
+    if manifest_file.is_file():
+        previous = load_json(manifest_file)
+        if isinstance(previous, dict) and isinstance(previous.get("entries"), list):
+            existing = list(previous["entries"])
+    manifest_data = json.dumps({
+        "discussion_id": state.get("discussion_id"),
+        "disposition": disposition,
+        "entries": existing + manifest_entries,
+    }, ensure_ascii=False, indent=2).encode("utf-8")
+
+    state = dict(state)
+    state["submission_status"] = dict(state.get("submission_status") or {})
+    for agent in participants:
+        state["submission_status"][agent] = "submitted"
+    state["round"] = 1
+    state["stage"] = "cross_response"
+    state["instruction_queue"] = {agent: [] for agent in participants}
+    artifacts: dict[str, bytes] = {
+        document.relative_to(workspace).as_posix(): merged_content,
+        manifest_path: manifest_data,
+    }
+    deletions = proposal_paths if disposition == "delete" else []
+    instructions: list[Instruction] = []
+    discussion_relative = document.relative_to(workspace).as_posix()
+    for agent in participants:
+        prepared = prepare_inputs(
+            workspace,
+            agent,
+            [(workspace / "project-context.md", "project-context.md"), (document, "discussion.md")],
+            instruction_kind="respond",
+            source_contents={discussion_relative: merged_content},
+        )
+        instruction = _new_instruction(
+            state, workspace, agent, "respond", round_number=1, prepared_inputs=prepared,
+        )
+        instructions.append(instruction)
+        artifacts.update(prepared.artifacts)
+        artifacts.update(_instruction_artifacts(workspace, instruction))
+        state["instruction_queue"][agent].append(instruction.instruction_id)
+    state["response_status"] = {agent: "pending" for agent in participants}
+    # The transaction publishes this Markdown bytestring; bind the snapshot
+    # hash in the state that will be committed so the next pass does not see
+    # a false content-authority conflict.
+    authority = dict(state.get("content_authority") or {})
+    authority["discussion_path"] = discussion_relative
+    authority["sha256"] = hashlib.sha256(merged_content).hexdigest()
+    state["content_authority"] = authority
+    event_payload = {
+        "stage_before": "independent_proposal",
+        "stage_after": "cross_response",
+        "round": 1,
+        "instruction_ids": [item.instruction_id for item in instructions],
+        "proposal_paths": proposal_paths,
+        "proposal_disposition": disposition,
+    }
+    commit_transaction(
+        workspace,
+        event_type="proposal_merged",
+        event_payload=event_payload,
+        artifacts=artifacts,
+        deletions=deletions,
+        expected_revision=expected_revision,
+        state_update=state,
+    )
+    state["revision"] = expected_revision + 1
+    for instruction in instructions:
+        result.issued_instruction_ids.append(instruction.instruction_id)
+        _modern_instruction_event(workspace, state, instruction)
+    return state
 
 
 def _merge_and_dispose(workspace: Path, state: dict[str, Any], participants: list[str]) -> None:
@@ -848,6 +1395,77 @@ def _build_candidate(workspace: Path, state: dict[str, Any], participants: list[
     ])
     if not state.get("candidate_decision_ids"):
         state["candidate_decision_ids"] = ["C-0001"]
+
+
+def _candidate_transition(
+    workspace: Path,
+    state: dict[str, Any],
+    participants: list[str],
+    *,
+    expected_revision: int,
+) -> dict[str, Any]:
+    """Atomically materialize the modern candidate decision package.
+
+    Candidate Markdown is authoritative content, so its mutation and the
+    candidate stage/metadata must share one transaction. Word generation and
+    opening remain outside this transaction because they are external side
+    effects and are retried from the durable ``candidate_decision`` state.
+    """
+    document = _main_markdown(workspace)
+    if document is None:
+        raise WorkflowError("主讨论 Markdown 不存在", E_SCHEMA)
+    content = document.read_text(encoding="utf-8")
+    sections: list[tuple[str, str]] = []
+    current_round = int(state.get("round", 1) or 1)
+    for agent in participants:
+        path = _participant_output_path(workspace, agent, "responses")
+        if _round_lifecycle(state):
+            path = workspace / ".multiagent" / "views" / agent / "outputs" / ("round-%d" % current_round) / "交叉回应文档.md"
+        if not path.is_file():
+            raise WorkflowError("response output missing for candidate", E_SCHEMA, agent_id=agent, round=current_round)
+        text = path.read_text(encoding="utf-8").strip()
+        sections.append((agent, "> 来源 SHA-256：`%s`\n\n%s" % (sha256_file(path), text)))
+    updated = _append_section_text(content, "## 三、交叉回应", sections)
+    updated = _append_section_text(updated, "## 四、结构化决策包", [
+        ("候选综合", "以下内容综合独立提案与交叉回应，仅形成候选供 Rainier 审阅；不构成已确认决策。请检查共识、分歧、风险和待选择事项。"),
+    ])
+    updated = _append_section_text(updated, "## 五、候选决策与 Word 审阅", [
+        ("候选审阅", "状态：候选、待 Rainier 审阅，不是正式决策。\n\n- 候选 ID：C-0001\n- 候选 Markdown：`.multiagent/deliverables/candidate.md`\n- 候选 Word：`候选决策.docx`\n- 候选 Word 打开后进入 human_review；Rainier 确认并发布正式结论后，才请求参与者停止监测。"),
+    ])
+    updated_data = updated.encode("utf-8")
+    discussion_relative = document.relative_to(workspace).as_posix()
+    state = dict(state)
+    state["stage"] = "candidate_decision"
+    state["candidate_decision_ids"] = list(state.get("candidate_decision_ids") or ["C-0001"])
+    if "C-0001" not in state["candidate_decision_ids"]:
+        state["candidate_decision_ids"].append("C-0001")
+    state["candidate"] = {
+        "candidate_id": "C-0001",
+        "status": "candidate",
+        "source_round": current_round,
+        "discussion_path": discussion_relative,
+        "discussion_sha256": hashlib.sha256(updated_data).hexdigest(),
+        "created_at": _now(),
+    }
+    authority = dict(state.get("content_authority") or {})
+    authority["discussion_path"] = discussion_relative
+    authority["sha256"] = hashlib.sha256(updated_data).hexdigest()
+    state["content_authority"] = authority
+    commit_transaction(
+        workspace,
+        event_type="candidate_decision_created",
+        event_payload={
+            "candidate_id": "C-0001",
+            "source_round": current_round,
+            "discussion_path": discussion_relative,
+            "discussion_sha256": hashlib.sha256(updated_data).hexdigest(),
+        },
+        artifacts={discussion_relative: updated_data},
+        expected_revision=expected_revision,
+        state_update=state,
+    )
+    state["revision"] = expected_revision + 1
+    return state
 
 
 def _markdown_section_items(text: str, titles: tuple[str, ...]) -> list[str]:
@@ -905,20 +1523,33 @@ def _evaluate_convergence(
     participants: list[str],
     current_round: int,
 ) -> dict[str, Any] | None:
-    config = state.get("convergence") if isinstance(state.get("convergence"), dict) else {}
-    evaluator = ConvergenceEvaluator(
-        min_response_rounds=int(config.get("min_response_rounds", 1)),
-        max_response_rounds=int(config.get("max_response_rounds", 3)),
-        no_new_issue_rounds=int(config.get("no_new_issue_rounds", 1)),
-        participant_ids=participants,
-    )
-    latest = None
-    for round_number in range(1, current_round + 1):
-        responses = _response_records_for_round(workspace, receipts, participants, round_number)
-        if len(responses) != len(participants):
-            return None
-        latest = evaluator.evaluate_round(responses)
-    return latest.to_dict() if latest is not None else None
+    """Load and schema-check the Coordinator's semantic assessment.
+
+    Completeness is checked by the caller.  The modern workflow must never
+    infer semantic convergence from response text or quiet-round counters.
+    """
+    path = workspace / ".multiagent" / "convergence" / ("round-%d.json" % current_round)
+    if not path.is_file():
+        return None
+    try:
+        payload = load_json(path)
+        assessment = validate_convergence_assessment(payload, participant_ids=participants)
+    except (WorkflowError, ConvergenceSchemaError, TypeError, ValueError) as exc:
+        raise WorkflowError(
+            "Coordinator 收敛评估不符合固定 JSON schema",
+            E_SCHEMA,
+            path=str(path),
+            round=current_round,
+        ) from exc
+    if assessment.get("round") != current_round:
+        raise WorkflowError(
+            "Coordinator 收敛评估 round 与当前轮次不一致",
+            E_SCHEMA,
+            path=str(path),
+            expected_round=current_round,
+            actual_round=assessment.get("round"),
+        )
+    return assessment
 
 
 def orchestrate_once(
@@ -941,6 +1572,7 @@ def orchestrate_once(
         validate_state_shape(state)
         validate_coordinator_execution(state, actor or "", platform_id or "", session_id or "")
         ensure_content_consistency(workspace, state)
+        _validate_round_snapshots(workspace, state)
         if state.get("stage") not in {
             "initialized", "independent_proposal", "cross_response", "candidate_decision",
             "human_review", "finalizing", "completed", "user_confirmation",
@@ -955,6 +1587,7 @@ def orchestrate_once(
             _participant_binding(state, participant)
         receipts = _read_receipts(workspace)
         changed = False
+        stop_requested_pending = False
         _, processed_failures, blockers = _automation_audit(state)
         for blocker in blockers:
             if isinstance(blocker, dict) and blocker.get("code") == E_RETRY_EXHAUSTED and E_RETRY_EXHAUSTED not in result.blocking_error_codes:
@@ -1027,20 +1660,30 @@ def orchestrate_once(
                     if _instruction_exists(workspace, agent, "bootstrap"):
                         instruction_dir = _instruction_root(workspace) / agent
                         for path in sorted(instruction_dir.glob("*-bootstrap-*.json")):
-                            _wake_existing(workspace, state, wake, result, agent, Instruction.from_dict(load_json(path)))
+                            instruction = Instruction.from_dict(load_json(path))
+                            if _round_lifecycle(state):
+                                _modern_instruction_event(workspace, state, instruction)
+                            else:
+                                _wake_existing(workspace, state, wake, result, agent, instruction)
                     else:
                         _issue(workspace, state, wake, result, agent, "bootstrap")
                         changed = True
 
         if state.get("stage") in {"initialized", "independent_proposal"} and _valid_completed_outputs(workspace, state, receipts, participants, {"propose", "repair"}, "proposals"):
-            _merge_and_dispose(workspace, state, participants)
             if modern_rounds:
-                state["round"] = 1
-            for agent in participants:
-                if not _instruction_exists(workspace, agent, "respond"):
-                    _issue(workspace, state, wake, result, agent, "respond", round_number=1 if modern_rounds else None)
-            state["stage"] = "cross_response"
-            changed = True
+                state = _proposal_transition(
+                    workspace, state, participants, wake, result,
+                    expected_revision=revision_before,
+                )
+                revision_before = int(state.get("revision", revision_before + 1))
+                changed = False
+            else:
+                _merge_and_dispose(workspace, state, participants)
+                for agent in participants:
+                    if not _instruction_exists(workspace, agent, "respond"):
+                        _issue(workspace, state, wake, result, agent, "respond")
+                state["stage"] = "cross_response"
+                changed = True
 
         if state.get("stage") == "cross_response":
             if not modern_rounds:
@@ -1053,38 +1696,57 @@ def orchestrate_once(
                 if _valid_completed_outputs(
                     workspace, state, receipts, participants, {"respond"}, "responses", current_round
                 ):
+                    round_metadata = (state.get("rounds") or {}).get(str(current_round))
+                    snapshot_published = isinstance(round_metadata, dict) and (
+                        round_metadata.get("status") in {"snapshot_published", "completed"}
+                    )
+                    if not snapshot_published:
+                        # Phase 1: make the complete response round visible as
+                        # an immutable public snapshot.  No next-round input,
+                        # state.round advance, or semantic decision occurs in
+                        # this transaction.
+                        state = _publish_round_snapshot(
+                            workspace,
+                            state,
+                            receipts,
+                            participants,
+                            current_round,
+                            expected_revision=revision_before,
+                        )
+                        revision_before = int(state.get("revision", revision_before + 1))
+                        changed = False
+
+                    # Phase 2 starts only after the coordinator has written a
+                    # valid assessment against the now-published snapshot.
                     convergence = _evaluate_convergence(
                         workspace, state, receipts, participants, current_round
                     )
                     if convergence is not None:
-                        state["convergence"] = {
-                            **(state.get("convergence") if isinstance(state.get("convergence"), dict) else {}),
-                            "last_result": convergence,
-                            "evaluated_round": current_round,
-                        }
-                        configured_max = int(
-                            (state.get("convergence") or {}).get("max_response_rounds", 3)
+                        state, has_next_round = _round_transition(
+                            workspace,
+                            state,
+                            receipts,
+                            participants,
+                            current_round,
+                            convergence,
+                            wake,
+                            result,
+                            expected_revision=revision_before,
                         )
-                        if convergence.get("converged") or current_round >= configured_max:
-                            _build_candidate(workspace, state, participants)
-                            state["stage"] = "candidate_decision"
-                            changed = True
-                        else:
-                            next_round = current_round + 1
-                            state["round"] = next_round
-                            for agent in participants:
-                                if not any(
-                                    _response_round(workspace, receipt) == next_round
-                                    and receipt.get("agent_id") == agent
-                                    and receipt.get("status") == "completed"
-                                    for receipt in receipts
-                                    if receipt.get("kind") == "respond"
-                                ):
-                                    _issue(
-                                        workspace, state, wake, result, agent, "respond",
-                                        round_number=next_round,
-                                    )
-                            changed = True
+                        # The round transition has already committed its own
+                        # state/event atomically. Any subsequent candidate
+                        # materialization is a separate state transition.
+                        revision_before = int(state.get("revision", revision_before + 1))
+                        changed = False
+                        if not has_next_round:
+                            state = _candidate_transition(
+                                workspace,
+                                state,
+                                participants,
+                                expected_revision=revision_before,
+                            )
+                            revision_before = int(state.get("revision", revision_before + 1))
+                            changed = False
 
         prior_delivery = state.get("candidate_delivery")
         if state.get("stage") == "candidate_decision" and (not isinstance(prior_delivery, dict) or prior_delivery.get("opened") is not True):
@@ -1147,10 +1809,27 @@ def orchestrate_once(
                     )]
                     result.warnings.append("候选 Word 已打开；等待参与者 stop completed 回执%s。" % ("：" + ", ".join(missing) if missing else ""))
 
-        # Stop is issued only after the confirmed final decision is published.
-        if state.get("stage") in {"finalizing", "confirmed_decision"}:
+        # A published final decision is acknowledged by every participant
+        # before any stop request is issued. Human review therefore keeps all
+        # monitors active until Rainier has confirmed the candidate.
+        if state.get("stage") == "finalizing" and modern_rounds:
+            if _ensure_final_ack_instructions(workspace, state, wake, result, participants):
+                changed = True
+            receipts = _read_receipts(workspace)
+            if _all_final_ack_receipts_completed(workspace, receipts, participants):
+                if _ensure_stop_instructions(workspace, state, wake, result, participants):
+                    changed = True
+                if not state.get("stop_requested_event_id"):
+                    state["stop_requested_event_id"] = "stop-requested-%s" % state.get("discussion_id", workspace.name)
+                    stop_requested_pending = True
+                    changed = True
+
+        # Legacy workspaces retain the pre-round confirmation contract.
+        if state.get("stage") == "finalizing" and not modern_rounds:
             if _ensure_stop_instructions(workspace, state, wake, result, participants):
                 changed = True
+
+        if state.get("stage") in {"finalizing", "confirmed_decision"}:
             receipts = _read_receipts(workspace)
             if _all_stop_receipts_completed(workspace, state, receipts, participants):
                 stopped_at = _now()
@@ -1160,8 +1839,6 @@ def orchestrate_once(
                 automation = dict(state.get("automation") or {})
                 automation.update({"enabled": False, "stopped_at": stopped_at})
                 state["automation"] = automation
-                # Monitors are now stopped; leave a durable confirmed_decision
-                # marker so the next pass can create/open the formal Word.
                 state["stage"] = "confirmed_decision"
                 changed = True
 
@@ -1200,13 +1877,18 @@ def orchestrate_once(
             state["last_orchestrated_at"] = _now()
             transaction = EventTransaction(workspace)
             transaction.commit(
-                event_type="orchestration_state_changed",
+                event_type="stop_requested" if stop_requested_pending else "orchestration_state_changed",
                 event_payload={
                     "stage_before": result.stage,
                     "stage_after": state.get("stage"),
                     "round": state.get("round", 0),
                     "issued_instruction_ids": list(result.issued_instruction_ids),
                     "blocking_error_codes": list(result.blocking_error_codes),
+                    **({
+                        "agent_ids": participants,
+                        "instruction_ids": dict((state.get("monitoring") or {}).get("stop_instruction_ids") or {}),
+                        "event_id": state.get("stop_requested_event_id"),
+                    } if stop_requested_pending else {}),
                 },
                 expected_revision=revision_before,
                 state_update=state,

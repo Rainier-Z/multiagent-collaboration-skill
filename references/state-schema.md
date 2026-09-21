@@ -38,6 +38,7 @@
 | convergence | object | 收敛门槛与结果摘要 |
 | coordinator_participant | object | 协调者作为 participant 的同一身份绑定 |
 | round | integer | 当前 cross_response 轮次，从 1 开始 |
+| rounds | object | 已完成轮次的 snapshot、收敛评估、下一轮和事务提交索引 |
 | blocking_items | array | 身份、隔离、唤醒、验证等未解决阻塞 |
 
 每个身份绑定对象必须包含 agent_id、role、platform_id、session_id。`agent_id` 表示逻辑身份；不得从 platform_id、账号或默认值推导它。协调者的四项绑定必须在启动时显式写入；缺项时不得启动流程。初始化时只向项目传 `public_key_b64` 与 `key_id`，项目保存验签公钥/指纹，签名私钥必须位于工作区外，严禁写入项目。
@@ -77,7 +78,7 @@ initialized
 
 `candidate_decision` 包含候选 Markdown/Word 生成。候选 Word 成功打开后进入 `human_review`，参与者监测仍保持 active；Rainier 确认后进入 `finalizing` 并发布正式结论。只有正式结论发布后才向每位参与者下发唯一 `stop` 指令，收齐唯一 completed stop 回执及有效证明后停止监测并进入 `confirmed_decision`。停止证明字段、哈希、身份、时序和 OpenClaw Automation 移除约束保持不变。
 
-OpenClaw 停止证明还必须包含 `automation_job_id`、`removal_verified: true`、带时区的 `removal_checked_at`。可信 OpenClaw 适配器实际执行 `openclaw cron rm <automation_job_id>`，然后以 `openclaw cron list --json` 核验目标 `automation_job_id` 完全不在列表中；目标仍存在但 disabled 也不算删除成功。记录实际命令、退出码、JSON 结果和时间到 `proof_reference` 指向的证据文件。OpenClaw stop 回执的 `receipt.at` 必须严格晚于 `removal_checked_at`，且不晚于当前验证时间。适配器完成路径、哈希、内容及时间顺序核验后，才使用工作区外可信适配器的受保护私钥签名；参与者自身不得签名或接触私钥。Ed25519 签名元数据为 `key_id`、`algorithm`、`signature_b64`，签名覆盖完整契约 payload。只有全部 stop 回执和证明验证通过后，协调者才可记录 `monitoring.enabled=false`、`monitoring.status=stopped`、`monitoring.stop_requested_at`，并进入 `user_confirmation`。仅把 state 字段改成 stopped 不代表实际停止，也不能通过门禁。普通文件系统协议无法防止工作区拥有者直接篡改 `state.json`；严格独立性依赖工作区外可信适配器、签名密钥与平台强制的沙箱/访问证据，平台无法提供时必须阻断而不得降级。确认仅能从 `user_confirmation` 推进至 `confirmed_decision`。正式 Word 生成并成功打开后才进入 `delivered`；打开失败或未请求打开时保留 `confirmed_decision`，不能伪报完成。`monitoring_stopped` 仅为显式停止或旧工作区兼容状态，不是正常交付阶段。拒绝、退回、隔离未验证、身份不匹配或缺少确认均不能推进。
+OpenClaw 停止证明还必须包含 `automation_job_id`、`removal_verified: true`、带时区的 `removal_checked_at`。可信 OpenClaw 适配器实际执行 `openclaw cron rm <automation_job_id>`，然后以 `openclaw cron list --json` 核验目标 `automation_job_id` 完全不在列表中；目标仍存在但 disabled 也不算删除成功。记录实际命令、退出码、JSON 结果和时间到 `proof_reference` 指向的证据文件。OpenClaw stop 回执的 `receipt.at` 必须严格晚于 `removal_checked_at`，且不晚于当前验证时间。适配器完成路径、哈希、内容及时间顺序核验后，才使用工作区外可信适配器的受保护私钥签名；参与者自身不得签名或接触私钥。Ed25519 签名元数据为 `key_id`、`algorithm`、`signature_b64`，签名覆盖完整契约 payload。只有全部 stop 回执和证明验证通过后，协调者才可记录 `monitoring.enabled=false`、`monitoring.status=stopped`、`monitoring.stop_requested_at`，并进入 `confirmed_decision`。仅把 state 字段改成 stopped 不代表实际停止，也不能通过门禁。普通文件系统协议无法防止工作区拥有者直接篡改 `state.json`；严格独立性依赖工作区外可信适配器、签名密钥与平台强制的沙箱/访问证据，平台无法提供时必须阻断而不得降级。正式 Word 生成并成功打开后才进入 `delivered`；打开失败或未请求打开时保留 `confirmed_decision`，不能伪报完成。`monitoring_stopped` 仅为显式停止或旧工作区兼容状态，不是正常交付阶段。拒绝、退回、隔离未验证、身份不匹配或缺少确认均不能推进。
 
 > 新协议覆盖说明：新初始化工作区在 `human_review` 保持监测 active；Rainier 确认后进入 `finalizing`，正式结论发布后才下发 stop。所有 stop 证明通过后进入 `confirmed_decision`。上段 `user_confirmation` 叙述仅适用于迁移前旧工作区。
 
@@ -174,6 +175,8 @@ OpenClaw 停止证明还必须包含 `automation_job_id`、`removal_verified: tr
 7. 阶段枚举：`initialized → independent_proposal → cross_response(round=N) → candidate_decision → human_review → finalizing → confirmed_decision → delivered`；`user_confirmation` 和 `monitoring_stopped` 仅用于旧工作区兼容。
 8. .multiagent/ 下 Runtime、视图、产物、指令、回执、审计的实际目录名。
 
+9. Round transition：`round-N.md`、下一轮指令、`state.round`/`revision` 与 `round_completed` event 必须来自同一事务；任一部分缺失或恢复不一致时不得推进。
+
 ## （八）运行时字段示例
 
 ```json
@@ -226,3 +229,5 @@ OpenClaw 停止证明还必须包含 `automation_job_id`、`removal_verified: tr
 尚未发布时，恢复入口仅在 state 仍匹配事务前快照的情况下补发记录的 state 快照。
 若事件、产物与 state 的组合既不属于上述情况，也不属于已完成事务，恢复必须
 fail-closed 报告失配，由协调者处理，不能猜测或覆盖用户的新状态。
+
+Round transition 使用同一提交协议：先验证当前轮次的完整回应和 Coordinator 收敛 JSON，再原子写入不可变 round snapshot、下一轮指令（若需要）和 `state.round`，最后追加 `round_completed` event 并提交 revision。下一轮只能读取上一个 snapshot；不得从初始讨论文档推断上一轮结果。`participant_monitor.py` 的 cursor 另存于 `.multiagent/monitors/<agent_id>/cursor.json`，事件流截断、重排或 cursor 锚点不匹配时也必须 fail-closed。

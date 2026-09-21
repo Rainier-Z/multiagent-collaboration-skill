@@ -1,16 +1,214 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Deterministic convergence evaluation for multi-round cross responses.
+"""Schema gate and compatibility helpers for multi-round convergence.
 
-This module deliberately has no filesystem, scheduler, or coordinator side
-effects.  It consumes structured participant responses and returns a small
-result object that a coordinator may later project into ``state.json``.
+Modern workflow note: semantic convergence is a constrained responsibility
+of the coordinator.  The coordinator reads the complete round snapshot and
+emits :class:`ConvergenceAssessment`; Python only validates that fixed JSON
+schema and participant references.  It must not infer ``converged`` from
+words such as ``"无"`` or from the number of quiet rounds.
+
+``ConvergenceEvaluator`` remains below as a backwards-compatible test helper
+for the original in-memory fixtures.  It is intentionally not the semantic
+decision maker for the modern workflow.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
+
+
+NO_CONTENT_MARKERS = frozenset({"无", "暂无", "没有", "none", "n/a", "-"})
+
+
+class ConvergenceSchemaError(ValueError):
+    """Raised when a coordinator assessment does not satisfy the JSON schema."""
+
+
+def _is_no_content(value: str) -> bool:
+    return value.strip().casefold() in NO_CONTENT_MARKERS
+
+
+def _normalize_content(value: Any) -> Any:
+    """Normalize explicit no-content markers without making semantic decisions.
+
+    The normalizer only changes representation.  In particular it never
+    changes either of the semantic booleans ``converged`` and
+    ``more_discussion``.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        return "" if _is_no_content(stripped) else stripped
+    if isinstance(value, list):
+        normalized = [_normalize_content(item) for item in value]
+        return [item for item in normalized if item not in ("", None, [])]
+    if isinstance(value, tuple):
+        return _normalize_content(list(value))
+    if isinstance(value, dict):
+        return {str(key): _normalize_content(item) for key, item in value.items()}
+    return value
+
+
+_ASSESSMENT_FIELDS = (
+    "round",
+    "new_substantive_issues",
+    "unanswered_arguments",
+    "new_evidence",
+    "remaining_disagreements",
+    "positions",
+    "value_conflicts",
+    "more_discussion",
+    "requires_human_decision",
+    "converged",
+    "reason",
+)
+
+
+@dataclass(frozen=True)
+class ConvergenceAssessment:
+    """Coordinator-authored semantic assessment for one response round.
+
+    This is the modern ``.multiagent/convergence/round-N.json`` contract.
+    ``positions`` maps a legal participant id to that participant's stated
+    position(s), so the schema gate can catch references to unknown agents.
+    No field is derived from another field; the two booleans are explicit
+    coordinator judgments.
+    """
+
+    round: int
+    new_substantive_issues: tuple[str, ...] = ()
+    unanswered_arguments: tuple[str, ...] = ()
+    new_evidence: tuple[str, ...] = ()
+    remaining_disagreements: tuple[str, ...] = ()
+    positions: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    value_conflicts: tuple[str, ...] = ()
+    more_discussion: bool = False
+    requires_human_decision: bool = False
+    converged: bool = False
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        if isinstance(self.round, bool) or not isinstance(self.round, int) or self.round < 1:
+            raise ConvergenceSchemaError("round must be a positive integer")
+        for name in (
+            "new_substantive_issues",
+            "unanswered_arguments",
+            "new_evidence",
+            "remaining_disagreements",
+            "value_conflicts",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, (list, tuple)):
+                raise ConvergenceSchemaError(f"{name} must be an array of strings")
+            normalized = _normalize_content(list(value))
+            if any(not isinstance(item, str) for item in normalized):
+                raise ConvergenceSchemaError(f"{name} must be an array of strings")
+            object.__setattr__(self, name, tuple(normalized))
+
+        if not isinstance(self.positions, Mapping):
+            raise ConvergenceSchemaError("positions must be an object keyed by participant id")
+        normalized_positions: dict[str, tuple[str, ...]] = {}
+        for participant, values in self.positions.items():
+            if not isinstance(participant, str) or not participant.strip():
+                raise ConvergenceSchemaError("positions keys must be non-empty participant ids")
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, (list, tuple)):
+                raise ConvergenceSchemaError("each positions value must be an array of strings")
+            normalized_values = _normalize_content(list(values))
+            if any(not isinstance(item, str) for item in normalized_values):
+                raise ConvergenceSchemaError("each positions value must be an array of strings")
+            normalized_positions[participant.strip()] = tuple(normalized_values)
+        object.__setattr__(self, "positions", normalized_positions)
+
+        for name in ("more_discussion", "requires_human_decision", "converged"):
+            if not isinstance(getattr(self, name), bool):
+                raise ConvergenceSchemaError(f"{name} must be boolean")
+        if not isinstance(self.reason, str):
+            raise ConvergenceSchemaError("reason must be a string")
+        object.__setattr__(self, "reason", _normalize_content(self.reason))
+
+    @classmethod
+    def from_mapping(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        participant_ids: Sequence[str] | None = None,
+    ) -> "ConvergenceAssessment":
+        """Validate and normalize a coordinator JSON object.
+
+        ``participant_ids`` is the authoritative legal-reference set.  When
+        omitted, the gate still validates shape but cannot reject an unknown
+        participant.  The optional long-form key from early drafts is accepted
+        as an input alias and always serialized as ``more_discussion``.
+        """
+        if not isinstance(payload, Mapping):
+            raise ConvergenceSchemaError("assessment must be a JSON object")
+        missing = [name for name in _ASSESSMENT_FIELDS if name not in payload and not (
+            name == "more_discussion" and "would_more_discussion_add_information" in payload
+        )]
+        if missing:
+            raise ConvergenceSchemaError("missing required fields: " + ", ".join(missing))
+        unknown = sorted(set(payload) - set(_ASSESSMENT_FIELDS) - {"would_more_discussion_add_information"})
+        if unknown:
+            raise ConvergenceSchemaError("unknown fields: " + ", ".join(map(str, unknown)))
+        more_discussion = payload.get("more_discussion", payload.get("would_more_discussion_add_information"))
+        assessment = cls(
+            round=payload.get("round"),  # type: ignore[arg-type]
+            new_substantive_issues=payload.get("new_substantive_issues"),  # type: ignore[arg-type]
+            unanswered_arguments=payload.get("unanswered_arguments"),  # type: ignore[arg-type]
+            new_evidence=payload.get("new_evidence"),  # type: ignore[arg-type]
+            remaining_disagreements=payload.get("remaining_disagreements"),  # type: ignore[arg-type]
+            positions=payload.get("positions"),  # type: ignore[arg-type]
+            value_conflicts=payload.get("value_conflicts"),  # type: ignore[arg-type]
+            more_discussion=more_discussion,  # type: ignore[arg-type]
+            requires_human_decision=payload.get("requires_human_decision"),  # type: ignore[arg-type]
+            converged=payload.get("converged"),  # type: ignore[arg-type]
+            reason=payload.get("reason"),  # type: ignore[arg-type]
+        )
+        legal = None if participant_ids is None else {
+            item.strip() for item in participant_ids if isinstance(item, str) and item.strip()
+        }
+        if participant_ids is not None and len(legal or ()) != len(tuple(participant_ids)):
+            raise ConvergenceSchemaError("participant_ids must contain non-empty strings")
+        if legal is not None:
+            unknown_participants = sorted(set(assessment.positions) - legal)
+            if unknown_participants:
+                raise ConvergenceSchemaError(
+                    "positions reference unknown participants: " + ", ".join(unknown_participants)
+                )
+        return assessment
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the canonical fixed-schema JSON-compatible mapping."""
+        return {
+            "round": self.round,
+            "new_substantive_issues": list(self.new_substantive_issues),
+            "unanswered_arguments": list(self.unanswered_arguments),
+            "new_evidence": list(self.new_evidence),
+            "remaining_disagreements": list(self.remaining_disagreements),
+            "positions": {key: list(values) for key, values in self.positions.items()},
+            "value_conflicts": list(self.value_conflicts),
+            "more_discussion": self.more_discussion,
+            "requires_human_decision": self.requires_human_decision,
+            "converged": self.converged,
+            "reason": self.reason,
+        }
+
+
+def validate_convergence_assessment(
+    payload: Mapping[str, object],
+    *,
+    participant_ids: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """Schema-gate a coordinator assessment and return canonical JSON data."""
+    return ConvergenceAssessment.from_mapping(payload, participant_ids=participant_ids).to_dict()
+
+
+# Short aliases make the gate discoverable to callers without changing the
+# canonical API used by the modern orchestrator integration.
+validate_convergence = validate_convergence_assessment
 
 
 def _items(values: Iterable[str] | str | None) -> tuple[str, ...]:
@@ -365,6 +563,9 @@ simulate_three_agent_lifecycle = run_fake_agent_lifecycle
 
 
 __all__ = [
+    "ConvergenceAssessment",
+    "ConvergenceSchemaError",
+    "NO_CONTENT_MARKERS",
     "AgentResponse",
     "ConvergenceEvaluator",
     "ConvergenceResult",
@@ -373,6 +574,8 @@ __all__ = [
     "LifecycleStep",
     "build_three_fake_agents",
     "evaluate_convergence",
+    "validate_convergence",
+    "validate_convergence_assessment",
     "run_fake_agent_lifecycle",
     "simulate_three_agent_lifecycle",
 ]

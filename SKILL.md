@@ -18,9 +18,9 @@ description: 多个平等、独立的 AI 参与者需要围绕同一议题形成
 
 ## （三）事件驱动流程
 
-共享工作区由 Event Stream 记录不可变事实，`state.json` 只保存当前快照；二者不可互相替代。每次状态变化遵循“验证前置条件 → 写业务产物/回执 → append event → 原子更新 state.revision”的事务顺序，崩溃后由事件日志和事务日志恢复，无法证明一致时 fail-closed。协调者单次运行门禁；门禁不得依赖常驻流程监测脚本。
+共享工作区由 Event Stream 记录不可变事实，业务文件保存可读数据，`state.json` 只保存当前快照；三者不可互相替代。每次状态变化遵循“验证前置条件 → 写业务产物/回执 → append event → 原子更新 state.revision”的事务顺序，崩溃后由事件日志和事务日志恢复，无法证明一致时 fail-closed。协调者单次运行门禁；门禁不依赖监测器自动推进，也即门禁不得依赖常驻流程监测脚本。
 
-Monitor 只回答“是否出现与当前 Agent 有关的新事件/指令”；Activation Bridge 才回答“已有会话能否继续执行”，结果只能是 `activated`、`manual_activation_required` 或 `activation_failed`。扫描不能冒充唤醒成功。Participant Runtime 负责读取完整指令、执行任务并回写产物与回执。
+`monitor_discussion.py` 是只读文件传感器；`participant_monitor.py` 是每个参与 Agent 可独立运行的持久 Event Consumer。后者读取并校验哈希链，从 `.multiagent/monitors/<agent_id>/cursor.json` 恢复位置，按 event_id 幂等处理相关事件，并把激活结果持久化；cursor 与事件流不一致时 fail-closed。Activation Bridge 才回答“已有会话能否继续执行”，结果只能是 `activated`、`manual_activation_required` 或 `activation_failed`。扫描不能冒充唤醒成功。Participant Runtime 负责读取完整指令、执行任务并回写产物与回执。
 
 讨论状态只使用以下正常阶段：
 
@@ -32,11 +32,12 @@ initialized → independent_proposal → cross_response(round=N) → candidate_d
 讨论交付顺序固定为：
 
 1. 协调者也以 `participant:<coordinator>` 身份独立提交 proposal；所有 proposal 完成前不得读取其他提案。
-2. 每一轮只用文件/receipt 判断回应是否齐全；只有“是否继续下一轮”交给 Convergence Evaluator。
-3. 收敛后生成候选 Markdown 和候选 Word，并自动打开候选 Word；候选 Word 打开成功后进入 `human_review`，参与者监测保持运行。
-4. Rainier 查看候选 Word 并确认；确认脚本先把正式结论发布到 Markdown，阶段进入 `finalizing`。
-5. 仅在正式结论发布后下发 stop；收齐唯一、绑定、有效的 stop 证明后停止监测，进入 `confirmed_decision`，再生成正式 Word。
-6. 正式 Word 打开成功才进入 `delivered`；失败时保留 `confirmed_decision`。旧工作区仍兼容 `user_confirmation` 和旧停机门禁。
+2. 每一轮只用文件/receipt 判断回应是否齐全；只有“是否继续下一轮”交给协调者承担的受约束 Semantic Convergence 职责。它读取完整 round snapshot，输出固定 JSON；这不是新增的独立 Agent。Python 只做 schema、轮次和参与者引用校验。
+3. 本轮完成必须通过一个原子 Round transition：不可变 `round-N.md`、下一轮 instructions（若需要）、`state.round`/`state.revision` 和 `round_completed` event 一并提交；事件、产物或 state 无法一致恢复时阻断。
+4. 收敛后生成候选 Markdown 和候选 Word，并自动打开候选 Word；候选 Word 打开成功后进入 `human_review`，参与者监测保持运行。
+5. Rainier 查看候选 Word 并确认；确认脚本先把正式结论发布到 Markdown，阶段进入 `finalizing`。
+6. 仅在正式结论发布后下发 stop；收齐唯一、绑定、有效的 stop 证明后停止监测，进入 `confirmed_decision`，再生成正式 Word。
+7. 正式 Word 打开成功才进入 `delivered`；失败时保留 `confirmed_decision`。旧工作区仍兼容 `user_confirmation` 和旧停机门禁。
 
 候选内容与正式决策必须分别标识、分别留痕；候选 Word 不能冒充正式交付物。确认、修改或拒绝候选的具体状态转换见 `references/collaboration-protocol.md`。
 

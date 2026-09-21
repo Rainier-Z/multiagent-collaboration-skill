@@ -120,7 +120,7 @@ def _expected_output(workspace: Path, agent_id: str, instruction: Instruction) -
         permitted = view_root / "outputs" / "提案文档.md"
     elif instruction.kind == "respond":
         permitted = view_root / "outputs" / "交叉回应文档.md"
-    elif instruction.kind == "stop":
+    elif instruction.kind in {"final_ack", "stop"}:
         permitted = path_in_workspace(workspace, ".multiagent/receipts/%s" % agent_id)
     else:
         permitted = path_in_workspace(workspace, ".multiagent/receipts/%s" % agent_id)
@@ -207,7 +207,7 @@ def run_instruction(workspace: Path, agent_id: str, instruction_id: str) -> int:
         manifest = verify_manifest(workspace, runtime_version=instruction.runtime_version)
         _expected_output(workspace, agent_id, instruction)
         input_manifest = _validate_inputs(workspace, instruction)
-        if instruction.kind in {"propose", "repair"}:
+        if instruction.kind in {"propose", "repair", "final_ack"}:
             if instruction.access_scope.get("security_mode", "strict") == "strict":
                 isolation_evidence = load_isolation_evidence(workspace, instruction)
             else:
@@ -232,6 +232,12 @@ def run_instruction(workspace: Path, agent_id: str, instruction_id: str) -> int:
             marker = path_in_workspace(workspace, ".multiagent/receipts/%s/%s-upgrade-marker.txt" % (agent_id, instruction.instruction_id))
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text("upgraded %s\n" % manifest.runtime_version, encoding="utf-8")
+            _completed(workspace, agent_id, instruction, marker, isolation_evidence)
+            return EXIT_OK
+        if instruction.kind == "final_ack":
+            marker = path_in_workspace(workspace, ".multiagent/receipts/%s/%s-final-ack-marker.txt" % (agent_id, instruction.instruction_id))
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("acknowledged\n", encoding="utf-8")
             _completed(workspace, agent_id, instruction, marker, isolation_evidence)
             return EXIT_OK
         if instruction.kind == "stop":

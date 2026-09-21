@@ -171,6 +171,7 @@ def build_state(discussion_id, participants, coordinator, now,
             "session_id": coordinator_session_id,
         },
         "round": 0,
+        "rounds": {},
         "last_checked_at": now,
         "revision": 1,
         # Runtime/queue fields are machine process authority. Participants never write them.

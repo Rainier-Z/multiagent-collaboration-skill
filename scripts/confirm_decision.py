@@ -49,7 +49,7 @@ from pathlib import Path
 
 from workflow_core import (
     WorkflowError, atomic_write_json, atomic_write_text, sha256_file,
-    validate_coordinator_execution,
+    validate_coordinator_execution, update_content_hash,
 )
 from export_docx import _default_state_path, _workspace_root_for_state, do_export
 from orchestrate_discussion import _all_stop_receipts_completed, _read_receipts
@@ -855,12 +855,16 @@ def main():
         print(gate_error, file=sys.stderr)
         return EXIT_PRECOND
 
-    # 受控编排：先写主讨论文档，再更新 state.json
-    try:
-        write_text(discussion, md_text_updated)
-    except OSError as e:
-        print("主讨论文档写入失败：%s" % e, file=sys.stderr)
-        return EXIT_ERR
+    # Modern workspaces commit Markdown + event + state atomically. Legacy
+    # workspaces retain the historical write order for compatibility.
+    modern = _modern_lifecycle(state)
+    discussion_relative = Path(discussion).resolve().relative_to(Path(base).resolve()).as_posix()
+    if not modern:
+        try:
+            write_text(discussion, md_text_updated)
+        except OSError as e:
+            print("主讨论文档写入失败：%s" % e, file=sys.stderr)
+            return EXIT_ERR
 
     # 更新 state.json：登记已确认 ID + 逐级推进阶段。每次成功写入 revision 恰好 +1，
     # 与 merge 逐级写入一致（state-schema §四.4）。已确认 ID 仅在最终写入时登记，
@@ -879,28 +883,41 @@ def main():
 
     # Publish the confirmed conclusion first. The coordinator orchestrator
     # issues stop instructions only after this durable finalization marker.
-    modern = _modern_lifecycle(state)
     state["stage"] = "finalizing" if modern else "confirmed_decision"
     state["revision"] += 1
     _add_confirmed()
     _renew_lease()
+    # Keep the authority hash in the transaction's state snapshot so the next
+    # coordinator pass cannot observe a false E_HASH split-brain. In modern
+    # mode the new bytes are staged by EventTransaction, not yet on disk.
+    if modern:
+        import hashlib
+        authority = dict(state.get("content_authority") or {})
+        authority["discussion_path"] = discussion_relative
+        authority["sha256"] = hashlib.sha256(md_text_updated.encode("utf-8")).hexdigest()
+        state["content_authority"] = authority
+    else:
+        update_content_hash(base, state)
     try:
         EventTransaction(base).commit(
-            event_type="decision_confirmed",
+            event_type="final_decision_published" if modern else "decision_confirmed",
             event_payload={
                 "candidate_id": candidate_id,
                 "stage_after": state["stage"],
                 "discussion_path": Path(discussion).name,
-                "discussion_sha256": sha256_file(discussion),
+                "discussion_sha256": (
+                    state.get("content_authority", {}).get("sha256")
+                    if modern else sha256_file(discussion)
+                ),
             },
-            artifacts={},
+            artifacts={discussion_relative: md_text_updated.encode("utf-8")} if modern else {},
             receipts={},
             expected_revision=base_rev,
             state_update=state,
         )
     except Exception as e:
         print("state.json / 事件日志写入失败：%s" % e, file=sys.stderr)
-        print("恢复入口：主文档已记录确认（含候选决策 ID），幂等重跑本脚本可完成固化。", file=sys.stderr)
+        print("恢复入口：事务未发布，Markdown/state 保持一致；幂等重跑本脚本可完成固化。", file=sys.stderr)
         return EXIT_ERR
 
     print("候选决策 %s 已固化（阶段=%s，revision=%d），记录者=%s。" % (

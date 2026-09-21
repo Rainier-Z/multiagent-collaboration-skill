@@ -15,7 +15,7 @@
         └── 产物与回执 ◄─┘
 ```
 
-每次有效产物或回执写入后，协调者单次运行门禁。Event Stream 是事实日志，state.json 是当前快照；Monitor 只发现相关事件，Activation Bridge 只报告真实会话能否继续（activated/manual_activation_required/activation_failed），Runtime 执行指令。常驻监测不是主流程依赖。
+每次有效产物或回执写入后，协调者单次运行门禁。Event Stream 是事实日志，文件是业务数据，state.json 是当前快照；三者不能互相替代。只读传感器 `monitor_discussion.py` 只观察文件，持久 `participant_monitor.py` 才消费事件、维护每个 Agent 的 cursor 并调用 Activation Bridge。Activation Bridge 只报告真实会话能否继续（`activated` / `manual_activation_required` / `activation_failed`），Runtime 执行指令；监测器不能替代协调者门禁或伪造执行完成。
 
 ## （二）Skill 目录
 
@@ -42,15 +42,15 @@ multiagent-collaboration/
 2. 用 assets/ 中模板发布项目级指令；每条指令须含完整 task_prompt。
 3. 每次产物或回执写入后，协调者单次运行门禁；完整候选审阅与正式交付顺序以 references/collaboration-protocol.md 为准。
 
-### 假 Agent 闭环演习
+### Fake Agent 验证边界
 
-在接入 Claude Code、Codex 或 OpenClaw 之前，可先运行三 Agent 的确定性演习，验证“多轮回应 → 收敛评估 → 人工审阅 → 正式决策 → 停机”生命周期：
+接入 Claude Code、Codex 或 OpenClaw 之前，必须先通过真实文件系统、Event Stream 和独立进程运行的 Fake E2E，验证“多轮回应 → 收敛评估 → 人工审阅 → 正式决策 → final_ack → 停机 → delivered”生命周期。仅通过内存夹具、组件单测或 `FakeWakeAdapter`，不能证明 cursor、并发、崩溃恢复和重复激活已经闭环：
 
 ```powershell
-py -3 -B -m unittest evals.test_convergence -v
+py -3 -B -m unittest discover -s evals -p 'test_*.py'
 ```
 
-该演习只验证协议状态，不声称唤醒了任何真实平台会话。
+上述命令覆盖组件和协议回归；其中只有标明真实进程/文件系统的 Fake E2E 才构成联调前的闭环证据。该验证不声称唤醒了任何真实平台会话；真实平台必须另行取得端到端 handoff 证据。
 
 ### 安全初始化（PowerShell）
 

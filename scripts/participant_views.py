@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -30,6 +31,23 @@ INDEPENDENCE_NOTE = (
     "Do not claim independence without platform sandbox/allowlist execution evidence; "
     "ordinary ACLs under the same user are not hard isolation."
 )
+
+
+@dataclass(frozen=True)
+class PreparedInputs:
+    """A sealed input publication ready to be committed by a caller.
+
+    ``artifacts`` deliberately contains only workspace-relative files.  The
+    coordinator can therefore stage the input snapshot, its immutable manifest
+    and the current-manifest pointer in the same EventTransaction as the
+    instruction that consumes them.
+    """
+
+    published: tuple[str, ...]
+    artifacts: dict[str, bytes]
+    manifest_relative: str
+    manifest_sha256: str
+    scope_digest: str
 
 
 def view_root(workspace: Path, agent_id: str) -> Path:
@@ -61,6 +79,140 @@ def _publish_manifest(workspace: Path, agent_id: str, published: list[str]) -> N
         manifest_target.write_bytes(data)
     atomic_write_json(
         path_in_workspace(workspace, view_relative + "/current_input_manifest.json"),
+        {"path": manifest_relative, "sha256": manifest_sha256, "scope_digest": manifest.scope_digest},
+    )
+
+
+def _allowed_input_source(workspace: Path, source_relative: str, name: str, instruction_kind: str) -> bool:
+    """Keep the same phase allow-list for both immediate and staged writes."""
+    allowed_source = source_relative == "project-context.md"
+    if instruction_kind == "bootstrap":
+        allowed_source = allowed_source or (
+            source_relative.startswith(".multiagent/runtime/participant/")
+            and source_relative.endswith("/manifest.json")
+        )
+    elif instruction_kind in {"respond", "final_ack"}:
+        state_path = workspace / ".multiagent" / "state.json"
+        discussion_relative = None
+        if state_path.is_file():
+            try:
+                state_value = json.loads(state_path.read_text(encoding="utf-8"))
+                discussion_relative = (state_value.get("content_authority") or {}).get("discussion_path")
+            except (OSError, json.JSONDecodeError):
+                discussion_relative = None
+        is_main_discussion = (
+            source_relative == discussion_relative
+            if isinstance(discussion_relative, str)
+            else source_relative == "discussion.md"
+        )
+        allowed_source = allowed_source or (is_main_discussion and name == "discussion.md")
+    elif instruction_kind == "repair":
+        # The caller still validates the exact agent-specific roots below;
+        # this branch is intentionally permissive only for source classification.
+        allowed_source = allowed_source or source_relative.startswith(".multiagent/views/") or source_relative.startswith(".multiagent/receipts/")
+    return allowed_source
+
+
+def prepare_inputs(
+    workspace: Path,
+    agent_id: str,
+    sources: list[tuple[Path, str]],
+    *,
+    instruction_kind: str = "propose",
+    source_contents: dict[str, bytes] | None = None,
+) -> PreparedInputs:
+    """Prepare, but do not publish, a sealed input view.
+
+    This is the transaction-friendly counterpart to :func:`publish_inputs`.
+    It computes the exact immutable filenames and manifest bytes without
+    touching the workspace, allowing round transition to atomically publish
+    ``round-N.md``, input views and next-round instructions together.
+    """
+    workspace = Path(workspace).resolve()
+    agent_id = validate_participant_id(agent_id)
+    supported_kinds = {"bootstrap", "propose", "respond", "repair", "final_ack", "upgrade", "stop"}
+    if instruction_kind not in supported_kinds:
+        raise WorkflowError("unsupported instruction kind", E_PATH_SCOPE, kind=instruction_kind)
+    input_root = view_root(workspace, agent_id) / "inputs"
+    published: list[str] = []
+    artifacts: dict[str, bytes] = {}
+    seen_names: set[str] = set()
+    for source, name in sources:
+        source_path = Path(source).resolve()
+        try:
+            source_path.relative_to(workspace)
+        except ValueError as exc:
+            raise WorkflowError("input source is outside the workspace", E_PATH_SCOPE, path=str(source)) from exc
+        source_relative = source_path.relative_to(workspace).as_posix()
+        override = (source_contents or {}).get(source_relative)
+        if not source_path.is_file() and override is None:
+            raise WorkflowError("input source is not a file", E_PATH_SCOPE, path=str(source))
+        allowed_source = _allowed_input_source(workspace, source_relative, name, instruction_kind)
+        if instruction_kind == "repair":
+            allowed_source = allowed_source and (
+                source_relative.startswith(".multiagent/views/%s/outputs/" % agent_id)
+                or source_relative.startswith(".multiagent/receipts/%s/" % agent_id)
+                or source_relative == "project-context.md"
+            )
+        if instruction_kind == "respond" and source_relative.startswith(".multiagent/rounds/"):
+            # Public round snapshots are the only additional input admitted to
+            # a later response round; private participant outputs remain sealed.
+            allowed_source = source_relative.startswith(".multiagent/rounds/") and source_relative.endswith(".md")
+        if not allowed_source:
+            raise WorkflowError(
+                "input source is not allowed for this instruction phase",
+                E_PATH_SCOPE, path=source_relative, kind=instruction_kind, agent_id=agent_id,
+            )
+        target = input_root / name
+        source_content = override if override is not None else source_path.read_bytes()
+        if target.exists() and target.read_bytes() != source_content:
+            requested_name = Path(name)
+            digest_suffix = hashlib.sha256(source_content).hexdigest()[:12]
+            target = input_root / ("%s-%s%s" % (requested_name.stem, digest_suffix, requested_name.suffix))
+        try:
+            target.relative_to(input_root)
+        except ValueError as exc:
+            raise WorkflowError("input target is outside the participant view", E_PATH_SCOPE, path=name) from exc
+        relative = target.relative_to(workspace).as_posix()
+        if relative in seen_names:
+            raise WorkflowError("duplicate input target", E_PATH_SCOPE, path=relative)
+        seen_names.add(relative)
+        if target.exists() and (not target.is_file() or target.read_bytes() != source_content):
+            raise WorkflowError("sealed input snapshot is immutable", E_STATE_CONFLICT, path=relative)
+        published.append(relative)
+        artifacts[relative] = source_content
+    files = [{"path": relative, "sha256": hashlib.sha256(artifacts[relative]).hexdigest()} for relative in published]
+    manifest = InputManifest(
+        agent_id=agent_id,
+        view_root=".multiagent/views/%s" % agent_id,
+        files=tuple((item["path"], item["sha256"]) for item in files),
+        scope_digest=input_scope_digest(agent_id, files),
+    )
+    manifest_data = json.dumps(manifest.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    manifest_sha256 = hashlib.sha256(manifest_data).hexdigest()
+    manifest_relative = input_manifest_path(agent_id, manifest_sha256)
+    manifest_target = path_in_workspace(workspace, manifest_relative)
+    if manifest_target.exists() and manifest_target.read_bytes() != manifest_data:
+        raise WorkflowError("sealed input manifest is immutable", E_STATE_CONFLICT, path=manifest_relative)
+    artifacts[manifest_relative] = manifest_data
+    reference_relative = ".multiagent/views/%s/current_input_manifest.json" % agent_id
+    artifacts[reference_relative] = json.dumps(
+        {"path": manifest_relative, "sha256": manifest_sha256, "scope_digest": manifest.scope_digest},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return PreparedInputs(tuple(published), artifacts, manifest_relative, manifest_sha256, manifest.scope_digest)
+    data = json.dumps(manifest.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    manifest_sha256 = hashlib.sha256(data).hexdigest()
+    manifest_relative = input_manifest_path(agent_id, manifest_sha256)
+    manifest_target = path_in_workspace(workspace, manifest_relative)
+    manifest_target.parent.mkdir(parents=True, exist_ok=True)
+    if manifest_target.exists():
+        if not manifest_target.is_file() or manifest_target.read_bytes() != data:
+            raise WorkflowError("sealed input manifest is immutable", E_STATE_CONFLICT, path=manifest_relative)
+    else:
+        manifest_target.write_bytes(data)
+    atomic_write_json(
+        path_in_workspace(workspace, view_relative + "/current_input_manifest.json"),
         {
             "path": manifest_relative,
             "sha256": manifest_sha256,
@@ -78,7 +230,7 @@ def publish_inputs(
 ) -> list[str]:
     workspace = Path(workspace).resolve()
     agent_id = validate_participant_id(agent_id)
-    supported_kinds = {"bootstrap", "propose", "respond", "repair", "upgrade", "stop"}
+    supported_kinds = {"bootstrap", "propose", "respond", "repair", "final_ack", "upgrade", "stop"}
     if instruction_kind not in supported_kinds:
         raise WorkflowError("unsupported instruction kind", E_PATH_SCOPE, kind=instruction_kind)
     input_root = view_root(workspace, agent_id) / "inputs"
@@ -100,7 +252,7 @@ def publish_inputs(
                 source_relative.startswith(".multiagent/runtime/participant/")
                 and source_relative.endswith("/manifest.json")
             )
-        elif instruction_kind == "respond":
+        elif instruction_kind in {"respond", "final_ack"}:
             state_path = workspace / ".multiagent" / "state.json"
             discussion_relative = None
             if state_path.is_file():
@@ -172,38 +324,25 @@ def output_path(workspace: Path, agent_id: str, kind: str) -> str:
     elif kind == "respond":
         name = "交叉回应文档.md"
     else:
-        if kind not in {"bootstrap", "upgrade", "stop"}:
+        if kind not in {"bootstrap", "final_ack", "upgrade", "stop"}:
             raise WorkflowError("unsupported instruction kind", E_PATH_SCOPE, kind=kind)
         return ".multiagent/receipts/%s" % validate_participant_id(agent_id)
     return (root / name).relative_to(workspace).as_posix()
 
 
-def access_scope(workspace: Path, agent_id: str) -> dict[str, object]:
+def access_scope_for_manifest(
+    workspace: Path,
+    agent_id: str,
+    manifest_relative: str,
+    manifest_sha256: str,
+    scope_digest: str,
+) -> dict[str, object]:
+    """Build the exact scope before its manifest is committed."""
     workspace = Path(workspace).resolve()
     agent_id = validate_participant_id(agent_id)
     root = view_root(workspace, agent_id).relative_to(workspace).as_posix()
-    current_manifest_path = path_in_workspace(
-        workspace,
-        root + "/current_input_manifest.json",
-    )
-    if not current_manifest_path.is_file():
-        raise WorkflowError("participant view has no published input manifest", E_STATE_CONFLICT, agent_id=agent_id)
-    try:
-        reference = json.loads(current_manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise WorkflowError("participant input manifest reference is unreadable", E_STATE_CONFLICT, agent_id=agent_id) from exc
-    manifest_relative = input_manifest_path(agent_id, str(reference.get("sha256", "")))
-    if reference.get("path") != manifest_relative:
-        raise WorkflowError("participant input manifest reference is invalid", E_STATE_CONFLICT, agent_id=agent_id)
-    manifest_file = path_in_workspace(workspace, manifest_relative)
-    if not manifest_file.is_file() or sha256_file(manifest_file) != reference.get("sha256"):
-        raise WorkflowError("participant input manifest reference hash mismatch", E_STATE_CONFLICT, agent_id=agent_id)
-    try:
-        manifest = InputManifest.from_dict(json.loads(manifest_file.read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise WorkflowError("participant input manifest is unreadable", E_STATE_CONFLICT, agent_id=agent_id) from exc
-    if manifest.scope_digest != reference.get("scope_digest"):
-        raise WorkflowError("participant input manifest scope digest mismatch", E_STATE_CONFLICT, agent_id=agent_id)
+    if manifest_relative != input_manifest_path(agent_id, manifest_sha256):
+        raise WorkflowError("participant input manifest path is invalid", E_STATE_CONFLICT, agent_id=agent_id)
     state_path = path_in_workspace(workspace, ".multiagent/state.json")
     security_mode = "strict"
     try:
@@ -223,8 +362,8 @@ def access_scope(workspace: Path, agent_id: str) -> dict[str, object]:
         "independence_claim_requires_enforcement_receipt": security_mode == "strict",
         "security_note": INDEPENDENCE_NOTE,
         "input_manifest_path": manifest_relative,
-        "input_manifest_sha256": reference["sha256"],
-        "scope_digest": manifest.scope_digest,
+        "input_manifest_sha256": manifest_sha256,
+        "scope_digest": scope_digest,
     }
     try:
         state_path = path_in_workspace(workspace, ".multiagent/state.json")
@@ -250,3 +389,30 @@ def access_scope(workspace: Path, agent_id: str) -> dict[str, object]:
     if verifier is not None:
         scope["attestation_verifier"] = verifier
     return scope
+
+
+def access_scope(workspace: Path, agent_id: str) -> dict[str, object]:
+    workspace = Path(workspace).resolve()
+    agent_id = validate_participant_id(agent_id)
+    root = view_root(workspace, agent_id).relative_to(workspace).as_posix()
+    current_manifest_path = path_in_workspace(workspace, root + "/current_input_manifest.json")
+    if not current_manifest_path.is_file():
+        raise WorkflowError("participant view has no published input manifest", E_STATE_CONFLICT, agent_id=agent_id)
+    try:
+        reference = json.loads(current_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkflowError("participant input manifest reference is unreadable", E_STATE_CONFLICT, agent_id=agent_id) from exc
+    manifest_sha256 = str(reference.get("sha256", ""))
+    manifest_relative = input_manifest_path(agent_id, manifest_sha256)
+    if reference.get("path") != manifest_relative:
+        raise WorkflowError("participant input manifest reference is invalid", E_STATE_CONFLICT, agent_id=agent_id)
+    manifest_file = path_in_workspace(workspace, manifest_relative)
+    if not manifest_file.is_file() or sha256_file(manifest_file) != manifest_sha256:
+        raise WorkflowError("participant input manifest reference hash mismatch", E_STATE_CONFLICT, agent_id=agent_id)
+    try:
+        manifest = InputManifest.from_dict(json.loads(manifest_file.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkflowError("participant input manifest is unreadable", E_STATE_CONFLICT, agent_id=agent_id) from exc
+    if manifest.scope_digest != reference.get("scope_digest"):
+        raise WorkflowError("participant input manifest scope digest mismatch", E_STATE_CONFLICT, agent_id=agent_id)
+    return access_scope_for_manifest(workspace, agent_id, manifest_relative, manifest_sha256, manifest.scope_digest)

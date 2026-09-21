@@ -47,7 +47,7 @@ E_ISOLATION_UNVERIFIED = "E_ISOLATION_UNVERIFIED"
 E_ISOLATION_EVIDENCE = E_ISOLATION_UNVERIFIED
 AGENT_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$")
 INSTRUCTION_ID_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$")
-INSTRUCTION_KINDS = frozenset({"bootstrap", "propose", "respond", "repair", "upgrade", "stop"})
+INSTRUCTION_KINDS = frozenset({"bootstrap", "propose", "respond", "repair", "final_ack", "upgrade", "stop"})
 TERMINAL_STATUSES = frozenset({"completed", "failed"})
 ENFORCEMENT_TYPES = frozenset({"platform_sandbox", "process_allowlist", "separate_os_identity"})
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -229,6 +229,7 @@ def _validate_participant_scope(
         "repair": view_root + "/outputs/提案文档.md",
         "respond": view_root + "/outputs/交叉回应文档.md",
     }
+    expected_outputs["final_ack"] = receipt_root
     expected_output = expected_outputs.get(kind, receipt_root)
     response_round_path = (
         kind == "respond"
@@ -825,6 +826,25 @@ def _validate_receipt_evidence_summary(
         raise _error("receipt isolation evidence summary identity mismatch", E_ISOLATION_UNVERIFIED)
     if summary.get("contract_validation") != "passed":
         raise _error("receipt isolation evidence contract was not validated", E_ISOLATION_UNVERIFIED)
+    # Normal-mode runtimes deliberately provide a path/hash contract rather
+    # than a platform attestation.  Keep the receipt binding strict, but do
+    # not make Ed25519 evidence a hidden requirement for every participant.
+    # Strict-mode summaries have ``mode=platform_enforced`` and continue
+    # through the attestation checks below.
+    if summary.get("mode") == "restricted_view":
+        if (
+            summary.get("view_root") != view_root
+            or summary.get("allowed_read_roots") != expected_read_roots
+            or summary.get("allowed_write_roots") != expected_write_roots
+            or summary.get("authenticity") != "path_and_hash_contract_only"
+            or summary.get("cryptographic_verification") != "not_performed"
+            or not isinstance(summary.get("scope_digest"), str)
+            or not SHA256_RE.fullmatch(summary["scope_digest"])
+            or not isinstance(summary.get("input_manifest_sha256"), str)
+            or not SHA256_RE.fullmatch(summary["input_manifest_sha256"])
+        ):
+            raise _error("normal-mode receipt path contract is invalid", E_ISOLATION_UNVERIFIED)
+        return
     if kind in {"propose", "repair"}:
         signed_evidence = summary.get("signed_evidence")
         verifier = summary.get("attestation_verifier")

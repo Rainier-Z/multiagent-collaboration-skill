@@ -1,6 +1,6 @@
 # <agent-id> 交叉回应文档
 
-> 使用说明：交叉回应阶段，各参与者只能基于本次指令密封提供的合并讨论副本与项目上下文写作，不得读取归档提案或其他参与者私有文件。写入 `.multiagent/views/<agent-id>/outputs/round-<round>/交叉回应文档.md`，`<agent-id>` 与 `.multiagent/state.json` 的 `expected_participants` 身份键完全一致。UTF-8 编码。共识与分歧须如实保留，不以多数票消解分歧。
+> 使用说明：交叉回应阶段，各参与者只能基于本次指令密封提供的上一轮 `round-<N-1>.md`（兼容称谓：指令密封提供的合并讨论副本；首轮为初始公共讨论快照）与项目上下文写作；不得读取归档提案、其他参与者私有文件或未纳入指令的材料。写入 `.multiagent/views/<agent-id>/outputs/round-<round>/交叉回应文档.md`，`<agent-id>` 与 `.multiagent/state.json` 的 `expected_participants` 身份键完全一致。UTF-8 编码。共识与分歧须如实保留，不以多数票消解分歧。
 
 ## 交叉回应追溯块
 

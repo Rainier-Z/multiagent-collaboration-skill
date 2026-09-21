@@ -28,7 +28,7 @@ import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 try:
     from events import EventStream, EventStreamError
@@ -114,7 +114,9 @@ class EventTransaction:
     """One ordered, journaled event/state transition.
 
     ``artifacts`` and ``receipts`` are mappings of workspace-relative paths to
-    text, bytes or JSON-compatible values.  ``state_update`` receives a deep
+    text, bytes or JSON-compatible values. ``deletions`` is an iterable of
+    workspace-relative files to remove in the same atomic transition.
+    ``state_update`` receives a deep
     copy of the current state and may return a replacement state.  It is also
     valid to pass a mapping, which is merged into the current state.
     """
@@ -154,6 +156,7 @@ class EventTransaction:
         event_payload: Mapping[str, Any],
         artifacts: Mapping[str, Any],
         receipts: Mapping[str, Any],
+        deletions: Iterable[str | Path],
         expected_revision: int | None,
         precondition: Callable[[dict[str, Any]], Any] | None,
         state_update: Callable[[dict[str, Any]], Any] | Mapping[str, Any] | None,
@@ -229,6 +232,16 @@ class EventTransaction:
                     "data_sha256": _hash_bytes(data),
                     "data_size": len(data),
                 })
+        if isinstance(deletions, (str, bytes)):
+            raise TransactionError("deletions 必须是路径序列，不能是字符串", E_SCHEMA)
+        for target in deletions:
+            relative = _relative(self.workspace, target)
+            if relative in forbidden:
+                raise TransactionError("业务删除不得删除 state 或事件流", E_STATE_CONFLICT, path=relative)
+            if relative in occupied:
+                raise TransactionError("事务写入/删除目标重复", E_STATE_CONFLICT, path=relative)
+            occupied.add(relative)
+            operations.append({"kind": "delete", "target": relative})
         return state, next_state, operations
 
     def commit(
@@ -238,6 +251,7 @@ class EventTransaction:
         event_payload: Mapping[str, Any] | None = None,
         artifacts: Mapping[str, Any] | None = None,
         receipts: Mapping[str, Any] | None = None,
+        deletions: Iterable[str | Path] | None = None,
         precondition: Callable[[dict[str, Any]], Any] | None = None,
         expected_revision: int | None = None,
         state_update: Callable[[dict[str, Any]], Any] | Mapping[str, Any] | None = None,
@@ -246,9 +260,10 @@ class EventTransaction:
         event_payload = event_payload or {}
         artifacts = artifacts or {}
         receipts = receipts or {}
+        deletions = tuple(deletions or ())
         state, next_state, operations = self._validate_inputs(
             event_type=event_type, event_payload=event_payload, artifacts=artifacts,
-            receipts=receipts, expected_revision=expected_revision,
+            receipts=receipts, deletions=deletions, expected_revision=expected_revision,
             precondition=precondition, state_update=state_update)
         if self.journal_path.exists():
             existing = _load_json(self.journal_path)
@@ -283,12 +298,15 @@ class EventTransaction:
         self._fault("preconditions_validated", journal)
         try:
             # Stage bytes after precondition validation, before first visible output.
-            for operation, values in zip(operations, list(artifacts.items()) + list(receipts.items())):
-                target, content = values
-                staged = self.staged / operation["target"]
-                data = _content_bytes(content)
+            values_by_target = {**dict(artifacts), **dict(receipts)}
+            for operation in operations:
+                if operation["kind"] == "delete":
+                    continue
+                target = operation["target"]
+                staged = self.staged / target
+                data = _content_bytes(values_by_target[target])
                 _atomic_bytes(staged, data)
-                operation["staged"] = operation["target"]
+                operation["staged"] = target
             journal["status"] = "staging"
             self._journal(journal)
             self._fault("staging", journal)
@@ -305,8 +323,14 @@ class EventTransaction:
                 else:
                     operation["before_exists"] = False
                     operation["before_sha256"] = None
-                target.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(self.staged / operation["staged"], target)
+                if operation["kind"] == "delete":
+                    if target.exists():
+                        if not target.is_file():
+                            raise TransactionError("事务删除目标不是普通文件", E_STATE_CONFLICT, path=operation["target"])
+                        target.unlink()
+                else:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(self.staged / operation["staged"], target)
                 operation["applied"] = True
                 journal["applied"] = index
                 journal["status"] = "artifacts_written"
@@ -315,7 +339,8 @@ class EventTransaction:
             event = self.event_stream.append(
                 event_type,
                 {**dict(event_payload), "transaction_id": self.transaction_id,
-                 "artifact_paths": [item["target"] for item in operations]},
+                 "artifact_paths": [item["target"] for item in operations if item["kind"] != "delete"],
+                 "deleted_paths": [item["target"] for item in operations if item["kind"] == "delete"]},
                 transaction_id=self.transaction_id,
                 revision_before=state["revision"], revision_after=next_state["revision"],
             )
@@ -450,10 +475,17 @@ def recover_transactions(
             if not operation.get("applied"):
                 staged = journal_path.parent / "staged" / operation["target"]
                 target = path_in_workspace(root, operation["target"])
-                if not staged.exists():
-                    raise TransactionRecoveryError("事务缺少可恢复产物", E_STATE_CONFLICT, transaction_id=txid, path=operation["target"])
-                _atomic_bytes(target, staged.read_bytes())
+                if operation.get("kind") == "delete":
+                    target.unlink(missing_ok=True)
+                else:
+                    if not staged.exists():
+                        raise TransactionRecoveryError("事务缺少可恢复产物", E_STATE_CONFLICT, transaction_id=txid, path=operation["target"])
+                    _atomic_bytes(target, staged.read_bytes())
             target = path_in_workspace(root, operation["target"])
+            if operation.get("kind") == "delete":
+                if target.exists():
+                    raise TransactionRecoveryError("事务删除产物仍存在", E_STATE_CONFLICT, transaction_id=txid, path=operation["target"])
+                continue
             if not target.is_file() or _hash_bytes(target.read_bytes()) != operation.get("data_sha256"):
                 raise TransactionRecoveryError("事务产物哈希失配", E_STATE_CONFLICT, transaction_id=txid, path=operation["target"])
         _atomic_bytes(state_file, _json_bytes(journal["state_after"]))
@@ -471,6 +503,7 @@ def commit_transaction(
     event_payload: Mapping[str, Any] | None = None,
     artifacts: Mapping[str, Any] | None = None,
     receipts: Mapping[str, Any] | None = None,
+    deletions: Iterable[str | Path] | None = None,
     precondition: Callable[[dict[str, Any]], Any] | None = None,
     expected_revision: int | None = None,
     state_update: Callable[[dict[str, Any]], Any] | Mapping[str, Any] | None = None,
@@ -481,11 +514,49 @@ def commit_transaction(
     tx = EventTransaction(workspace, transaction_id=transaction_id, fault_hook=fault_hook)
     return tx.commit(event_type=event_type, event_payload=event_payload,
                      artifacts=artifacts, receipts=receipts,
+                     deletions=deletions,
                      precondition=precondition, expected_revision=expected_revision,
                      state_update=state_update)
 
 
+def commit_round_transition(
+    workspace: str | Path,
+    *,
+    round_number: int,
+    snapshot_path: str | Path,
+    snapshot: Any,
+    next_round_instructions: Mapping[str | Path, Any] | None = None,
+    receipts: Mapping[str | Path, Any] | None = None,
+    deletions: Iterable[str | Path] | None = None,
+    state_update: Callable[[dict[str, Any]], Any] | Mapping[str, Any] | None = None,
+    expected_revision: int | None = None,
+    transaction_id: str | None = None,
+    fault_hook: Callable[[str, dict[str, Any]], None] | None = None,
+    event_type: str = "round.completed",
+    event_payload: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Atomically publish a completed round and next-round instructions."""
+    artifacts: dict[str | Path, Any] = {snapshot_path: snapshot}
+    artifacts.update(next_round_instructions or {})
+    return commit_transaction(
+        workspace,
+        event_type=event_type,
+        event_payload={
+            "round": round_number,
+            "snapshot_path": str(snapshot_path),
+            **dict(event_payload or {}),
+        },
+        artifacts=artifacts,
+        receipts=receipts,
+        deletions=deletions,
+        state_update=state_update,
+        expected_revision=expected_revision,
+        transaction_id=transaction_id,
+        fault_hook=fault_hook,
+    )
+
+
 __all__ = [
     "EventTransaction", "Transaction", "TransactionError", "TransactionManager",
-    "TransactionRecoveryError", "commit_transaction", "recover_transactions",
+    "TransactionRecoveryError", "commit_transaction", "commit_round_transition", "recover_transactions",
 ]

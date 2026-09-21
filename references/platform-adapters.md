@@ -4,7 +4,7 @@
 
 本层定义协调者如何把一次最小唤醒请求投递给显式绑定的平台会话。请求必须包含逻辑 agent_id、platform_id 和 session_id；不得根据默认值推断协调者或目标参与者平台。唤醒只通知会话读取工作区中的不可变指令，不承载完整讨论正文，也不证明参与者已完成。
 
-监测器只观察变化；门禁在每次有效产物或回执写入后由协调者单次运行；适配器负责可能的会话唤醒；Participant Runtime 负责读取完整 task_prompt 并执行。可选常驻看门狗仅处理超时或恢复，不能成为主流程推进依赖。参与者不需要启动通用轮询脚本。
+文件传感器只观察变化；持久 Participant Monitor 消费 Event Stream 并恢复自己的 cursor；门禁在每次有效产物或回执写入后由协调者单次运行；适配器负责可能的会话唤醒；Participant Runtime 负责读取完整 task_prompt 并执行。Monitor 不推进业务状态，门禁也不依赖它自动推进。
 
 ## （二）运行入口
 
@@ -33,7 +33,13 @@ WakeRequest 只携带定位字段，不允许携带提案、回应、讨论正�
 
 适配器默认不能调用未配置的 API、终端或会话。它们不保存 API Key、Token、密码或内部配置。
 
-## （四）平台状态
+## （四）Participant Monitor 与 Activation Bridge
+
+`scripts/monitor_discussion.py` 只做一次只读文件扫描；它不会消费事件、创建指令或推进阶段。`scripts/participant_monitor.py` 才是参与者侧的持久 Event Consumer：每个 Agent 使用自己的 `.multiagent/monitors/<agent_id>/cursor.json`，启动时验证完整 Event Stream，从 cursor 之后读取事件，只处理目标为自己的 `instruction_issued`、广播的 `final_decision_published` 和 `stop_requested`，并把每个 `event_id` 的激活结果持久化。结果已存在时不得重复激活；cursor 锚点不匹配或事件流被截断时停止并报错。
+
+Participant Monitor 只负责“发现并尝试激活”，不写 `state.json`、不生成业务产物、不判断收敛，也不把 `activated` 当成 Agent 已完成。没有独立验证的 dispatcher 时，适配器必须返回 `manual_activation_required`；只有外部平台真实接受最小 handoff 且具备端到端证据时才能返回 `activated`。这套机制可以持续运行并在重启后从 cursor 恢复，但仍不是 Coordinator 门禁或业务状态转换的替代品。
+
+## （五）平台状态
 
 | 平台 | 默认实现 | 当前 wake 验证状态 |
 |---|---|---|
@@ -55,7 +61,7 @@ OpenClaw 参与者支持以其原生 Automation/cron 进行项目级轮询，但
 4. 要求执行后只写自己的产物、回执和允许的扫描证据，并在前台报告扫描时间、阶段、指令 ID 与执行结果；
 5. 要求收到自己的 `stop` 指令、Rainier 明确停止，或进入 `monitoring_stopped`（仅显式停止/旧工作区兼容态，不是正常交付阶段）时，仅由可信 OpenClaw 适配器按已保存的 `automation_job_id` 停止本项目任务；参与者不得签名。适配器执行下述停止验证并保存证据，参与者只写自己的 stop 回执。
 
-**候选交付后的 stop 门禁**：候选 Word 成功打开后，协调者必须向每个参与者身份各发布唯一 stop 指令。停止证明 payload 与引用的证据 JSON 都必须包含 `instruction_sha256`，且等于原 stop 指令的 `sha256` 字段；payload 还必须完整包含统一字段：`discussion_id`、`instruction_id`、`instruction_sha256`、`agent_id`、`platform_id`、`session_id`、`stopped_at`、`mechanism`、`target`、`action_verified`、`proof_reference`、`proof_sha256`。OpenClaw 另含 `automation_job_id`、`removal_verified: true`、带时区的 `removal_checked_at`。可信 OpenClaw 适配器必须实际运行 `openclaw cron rm <automation_job_id>`，再运行 `openclaw cron list --json`；只有目标 `automation_job_id` 完全不在列表中才算删除成功，仍存在但 disabled 也失败。把实际命令结果、退出码、目标及时间写入工作区 `.multiagent/audit/platform-evidence/` 下真实 JSON。`proof_reference` 指向该 JSON，`proof_sha256` 是其原始字节的 SHA-256。验签前须验证文件解析后的最终路径仍位于解析后的证据根目录内，拒绝 symlink/junction 越界，并验证文件存在且为有效 JSON，哈希、内容、目标、指令哈希、讨论/指令/会话绑定和时序均正确；禁止跨讨论重放。`receipt.at` 不得晚于当前验证时间；OpenClaw stop 回执时间必须严格晚于 `removal_checked_at`。全部验证通过后，可信适配器才可从工作区外读取受保护的项目私钥生成 Ed25519 签名（`key_id`、`algorithm="ed25519"`、`signature_b64`），签名覆盖契约字段与证据哈希。OpenClaw 参与者不得读取私钥、自行签名或以自述替代实际核验。唯一 `completed` 回执必须引用签名证明。只有全部参与者的唯一、有效 completed 回执均通过校验后，协调者才能把项目监测标记为 stopped 并进入 `user_confirmation`。state.json 的 stopped 标志不是 Automation 已停止的证据；OpenClaw 未能移除任务、缺少签名/字段/证明引用或无法核验时回执必须 failed/blocked，流程不得进入用户确认阶段。
+**正式结论后的 stop 门禁**：Rainier 确认并发布正式结论后，协调者才向每个参与者身份各发布唯一 stop 指令。停止证明 payload 与引用的证据 JSON 都必须包含 `instruction_sha256`，且等于原 stop 指令的 `sha256` 字段；payload 还必须完整包含统一字段：`discussion_id`、`instruction_id`、`instruction_sha256`、`agent_id`、`platform_id`、`session_id`、`stopped_at`、`mechanism`、`target`、`action_verified`、`proof_reference`、`proof_sha256`。OpenClaw 另含 `automation_job_id`、`removal_verified: true`、带时区的 `removal_checked_at`。可信 OpenClaw 适配器必须实际运行 `openclaw cron rm <automation_job_id>`，再运行 `openclaw cron list --json`；只有目标 `automation_job_id` 完全不在列表中才算删除成功，仍存在但 disabled 也失败。把实际命令结果、退出码、目标及时间写入工作区 `.multiagent/audit/platform-evidence/` 下真实 JSON。`proof_reference` 指向该 JSON，`proof_sha256` 是其原始字节的 SHA-256。验签前须验证文件解析后的最终路径仍位于解析后的证据根目录内，拒绝 symlink/junction 越界，并验证文件存在且为有效 JSON，哈希、内容、目标、指令哈希、讨论/指令/会话绑定和时序均正确；禁止跨讨论重放。`receipt.at` 不得晚于当前验证时间；OpenClaw stop 回执时间必须严格晚于 `removal_checked_at`。全部验证通过后，可信适配器才可从工作区外读取受保护的项目私钥生成 Ed25519 签名（`key_id`、`algorithm="ed25519"`、`signature_b64`），签名覆盖契约字段与证据哈希。OpenClaw 参与者不得读取私钥、自行签名或以自述替代实际核验。唯一 `completed` 回执必须引用签名证明。只有全部参与者的唯一、有效 completed 回执均通过校验后，协调者才能把项目监测标记为 stopped 并进入 `confirmed_decision`。state.json 的 stopped 标志不是 Automation 已停止的证据；OpenClaw 未能移除任务、缺少签名/字段/证明引用或无法核验时回执必须 failed/blocked，流程不得进入 confirmed_decision。
 
 `operational_directive` 只能解释或执行已下发的指令；不得自行生成下一条指令、修改 `state.json`、争夺协调权或把后台扫描视为完成证据。使用 `session=current` 的任务仅适合端到端演习：它绑定创建时会话，不能单独证明长期稳定的身份或投递路由。长期运行须显式验证会话/频道路由与运行历史。
 
@@ -63,7 +69,7 @@ OpenClaw 参与者支持以其原生 Automation/cron 进行项目级轮询，但
 
 > 新协议覆盖说明：上述 stop 证明门禁适用于正式结论发布后的 `finalizing` 阶段；候选 Word 审阅期间保持监测，旧工作区才使用 `user_confirmation` 兼容路径。
 
-## （五）验证门槛
+## （六）验证门槛
 
 某平台的 wake 能力要标记为已验证，必须有可复现证据证明：
 
@@ -80,7 +86,7 @@ OpenClaw 参与者支持以其原生 Automation/cron 进行项目级轮询，但
 
 本文规定的是适配器契约，不是实测报告；不得声称已在任何真实 OpenClaw 环境验证。
 
-## （六）隔离 Attestation 信任锚
+## （七）隔离 Attestation 信任锚
 
 使用 `scripts/attestation_keys.py provision --workspace <工作区> --private-key-path <工作区外绝对 PEM 路径> --key-id <id>` 生成 key material，再把 JSON 输出的 `public_key_b64` 和 `key_id` 传给初始化器。工作区仅保存公钥/指纹，私钥始终在工作区外。每个验签进程必须设置非秘密环境变量 `MULTIAGENT_ATTESTATION_TRUSTED_KEYS_JSON`，其值是 `{"key-id":"public-key-b64"}` 形式的公开 JSON 对象；缺失、无效、未 pin 的 key 或签名不匹配均 fail-closed。平台 attestation 应签署输入视图清单哈希、执行会话身份、沙箱与读写白名单摘要、实际读取/拒绝访问证据及执行时间；验证器检查签名、公钥 key ID、讨论/指令绑定及新鲜时序。私钥只交由可信平台适配器，绝不交给参与者。OpenClaw 具体停止签名字段与门禁见本节上一段。配置公钥不代表相应平台已实现或验证了 attestation。
 使用 `scripts/attestation_keys.py provision --workspace <工作区> --private-key-path <工作区外绝对 PEM 路径> --key-id <id>` 生成 key material，再把 JSON 输出的 `public_key_b64` 和 `key_id` 传给初始化器。工作区仅保存公钥/指纹，私钥始终在工作区外。每个验签进程必须设置非秘密环境变量 `MULTIAGENT_ATTESTATION_TRUSTED_KEYS_JSON`，其值是 `{"key-id":"public-key-b64"}` 形式的公开 JSON 对象；缺失、无效、未 pin 的 key 或签名不匹配均 fail-closed。平台 attestation 应签署输入视图清单哈希、执行会话身份、沙箱与读写白名单摘要、实际读取/拒绝访问证据及执行时间；验证器检查签名、公钥 key ID、讨论/指令绑定及新鲜时序。私钥只交由工作区外可信平台适配器，绝不交给参与者。普通文件系统协议无法防止工作区拥有者直接篡改 `state.json`；严格独立性依赖工作区外可信适配器、受保护的签名密钥与平台强制的沙箱/访问证据。平台无法提供这些独立证据时必须阻断严格门禁，不得降级。OpenClaw 具体停止签名字段与门禁见本节上一段。配置公钥不代表相应平台已实现或验证了 attestation。

@@ -12,6 +12,8 @@ import shutil
 import sys
 import tempfile
 import unittest
+import json
+import os
 from pathlib import Path
 
 
@@ -70,6 +72,21 @@ class WorkflowCoreContractTests(unittest.TestCase):
             self.assertTrue((self.temp_dir / ".multiagent" / ".state.lock").exists())
 
         self.assertFalse((self.temp_dir / ".multiagent" / ".state.lock").exists())
+
+    def test_state_lock_reclaims_dead_owner(self) -> None:
+        lock = self.temp_dir / ".multiagent" / ".state.lock"
+        lock.mkdir(parents=True)
+        (lock / "owner.json").write_text(json.dumps({
+            "pid": 99999999,
+            "owner_token": "dead-owner",
+            "acquired_at": "2026-01-01T00:00:00+00:00",
+        }), encoding="utf-8")
+
+        with StateLock(self.temp_dir, timeout_seconds=0.2) as acquired:
+            owner = json.loads((lock / "owner.json").read_text(encoding="utf-8"))
+            self.assertEqual(owner["pid"], os.getpid())
+            self.assertNotEqual(owner["owner_token"], "dead-owner")
+            self.assertEqual(owner["owner_token"], acquired.owner_token)
 
     def test_load_state_reads_only_the_compact_internal_path(self) -> None:
         state = {

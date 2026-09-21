@@ -19,6 +19,7 @@ def build_task_prompt(kind: str, agent_id: str, coordinator_id: str, inputs: lis
         "repair": (
             "仅根据本指令可见的失败说明修复你自己的原产物，满足原任务和验收条件；不得扩展任务、读取或改写他方文件。"
         ),
+        "final_ack": "阅读本指令列出的正式结论输入，确认已收到并记录 final_ack 回执；不得修改正式结论、state.json 或其他参与者文件。",
         "upgrade": "仅验证指令指定的 Runtime 版本与哈希；不要修改其他参与者的文件或状态机。",
         "stop": "停止你为本项目启动的原生 Automation 或监测；记录停止结果并写 stop 回执，不再处理业务内容。",
     }
