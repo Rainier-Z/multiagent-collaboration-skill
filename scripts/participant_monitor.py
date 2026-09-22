@@ -51,7 +51,8 @@ INTERESTING_EVENTS = frozenset({
     "final_decision_published",
     "stop_requested",
 })
-_TERMINAL_RESULTS = frozenset({"activated", "manual_activation_required", "activation_failed"})
+_TERMINAL_RESULTS = frozenset({"activated", "manual_activation_required", "activation_failed", "activation_unknown"})
+_ACTIVATION_STATUSES = _TERMINAL_RESULTS | frozenset({"activation_pending"})
 
 
 class MonitorError(RuntimeError):
@@ -63,6 +64,8 @@ class Cursor:
     last_sequence: int = 0
     last_event_id: str | None = None
     last_event_hash: str | None = None
+    status: str = "active"
+    stop_instruction_id: str | None = None
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any] | None) -> "Cursor":
@@ -77,13 +80,21 @@ class Cursor:
             raise MonitorError("empty cursor cannot contain an event identity")
         if sequence > 0 and (not isinstance(event_id, str) or not isinstance(event_hash, str)):
             raise MonitorError("non-empty cursor must contain event identity")
-        return cls(sequence, event_id, event_hash)
+        status = value.get("status", "active")
+        stop_instruction_id = value.get("stop_instruction_id")
+        if status not in {"active", "stopping", "stopped"}:
+            raise MonitorError("cursor.status is invalid")
+        if stop_instruction_id is not None and not isinstance(stop_instruction_id, str):
+            raise MonitorError("cursor.stop_instruction_id must be a string")
+        return cls(sequence, event_id, event_hash, status, stop_instruction_id)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "last_sequence": self.last_sequence,
             "last_event_id": self.last_event_id,
             "last_event_hash": self.last_event_hash,
+            "status": self.status,
+            "stop_instruction_id": self.stop_instruction_id,
         }
 
 
@@ -97,6 +108,9 @@ class ActivationRecord:
     evidence: str
     recorded_at: str
     instruction_id: str | None = None
+    attempt_id: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -108,6 +122,9 @@ class ActivationRecord:
             "evidence": self.evidence,
             "recorded_at": self.recorded_at,
             "instruction_id": self.instruction_id,
+            "attempt_id": self.attempt_id,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
         }
 
 
@@ -141,6 +158,7 @@ class ParticipantMonitor:
         bridge: ActivationBridge,
         *,
         clock: Callable[[], str] = _now,
+        before_terminal_persist: Callable[[], None] | None = None,
     ) -> None:
         if not isinstance(agent_id, str) or not agent_id.strip():
             raise MonitorError("agent_id is required")
@@ -148,6 +166,8 @@ class ParticipantMonitor:
         self.agent_id = agent_id
         self.bridge = bridge
         self.clock = clock
+        self.before_terminal_persist = before_terminal_persist
+        self._recovered_pending = False
         self.cursor_path = path_in_workspace(
             self.workspace, CURSOR_RELATIVE.format(agent_id=agent_id)
         )
@@ -156,6 +176,8 @@ class ParticipantMonitor:
         )
         self._cursor = Cursor.from_dict(_load_object(self.cursor_path))
         self._results = self._load_results()
+        if self._recovered_pending:
+            self._persist_results()
 
     @property
     def cursor(self) -> Cursor:
@@ -185,9 +207,19 @@ class ParticipantMonitor:
                 evidence=str(value.get("evidence", "")),
                 recorded_at=str(value.get("recorded_at", "")),
                 instruction_id=value.get("instruction_id") if isinstance(value.get("instruction_id"), str) else None,
+                attempt_id=value.get("attempt_id") if isinstance(value.get("attempt_id"), str) else None,
+                started_at=value.get("started_at") if isinstance(value.get("started_at"), str) else None,
+                completed_at=value.get("completed_at") if isinstance(value.get("completed_at"), str) else None,
             )
-            if record.status not in _TERMINAL_RESULTS:
+            if record.status not in _ACTIVATION_STATUSES:
                 raise MonitorError("activation result status is not terminal")
+            if record.status == "activation_pending":
+                # The external bridge may already have accepted this request.
+                # Never guess that a retry is safe after process loss.
+                record = ActivationRecord(
+                    **{**record.to_dict(), "status": "activation_unknown", "detail": "monitor restarted after external activation began", "completed_at": self.clock(), "recorded_at": self.clock()}
+                )
+                self._recovered_pending = True
             results[event_id] = record
         return results
 
@@ -246,6 +278,9 @@ class ParticipantMonitor:
             return None
         instruction_id = payload.get("instruction_id")
         if not isinstance(instruction_id, str):
+            instruction_ids = payload.get("instruction_ids")
+            instruction_id = instruction_ids.get(self.agent_id) if isinstance(instruction_ids, Mapping) else None
+        if not isinstance(instruction_id, str):
             return None
         root = self.workspace / ".multiagent" / "instructions" / self.agent_id
         if not root.is_dir():
@@ -281,10 +316,22 @@ class ParticipantMonitor:
 
     def _activate(self, event: Mapping[str, Any]) -> ActivationRecord:
         event_id = str(event.get("event_id"))
+        request = self._request_for(event)
+        pending = ActivationRecord(
+            event_id=event_id, sequence=int(event.get("sequence", 0)),
+            event_type=str(event.get("event_type", "")), status="activation_pending",
+            detail="external activation started", evidence="", recorded_at=self.clock(),
+            instruction_id=request.instruction_id, attempt_id=uuid.uuid4().hex,
+            started_at=self.clock(), completed_at=None,
+        )
+        self._results[event_id] = pending
+        self._persist_results()
         try:
-            result = self.bridge.activate(self._request_for(event))
+            result = self.bridge.activate(request, idempotency_key=event_id)
         except Exception as exc:  # An adapter failure is an observable terminal result.
             result = ActivationResult("activation_failed", f"bridge raised {type(exc).__name__}")
+        if self.before_terminal_persist is not None:
+            self.before_terminal_persist()
         record = ActivationRecord(
             event_id=event_id,
             sequence=int(event.get("sequence", 0)),
@@ -292,12 +339,34 @@ class ParticipantMonitor:
             status=result.status,
             detail=result.detail,
             evidence=result.evidence,
-            recorded_at=self.clock(),
-            instruction_id=self._request_for(event).instruction_id,
+            recorded_at=self.clock(), instruction_id=request.instruction_id,
+            attempt_id=pending.attempt_id, started_at=pending.started_at, completed_at=self.clock(),
         )
         self._results[event_id] = record
         self._persist_results()
         return record
+
+    def _stop_receipt_completed(self) -> bool:
+        instruction_id = self._cursor.stop_instruction_id
+        if not instruction_id:
+            return False
+        instruction = self._instruction_for({"payload": {"instruction_id": instruction_id}})
+        if not instruction or instruction.get("kind") != "stop" or instruction.get("agent_id") != self.agent_id:
+            return False
+        expected_hash = instruction.get("sha256")
+        root = self.workspace / ".multiagent" / "receipts" / self.agent_id
+        for path in root.glob("*.json") if root.is_dir() else ():
+            receipt = _load_object(path)
+            if receipt and receipt.get("instruction_id") == instruction_id and receipt.get("agent_id") == self.agent_id and receipt.get("kind") == "stop" and receipt.get("status") == "completed" and receipt.get("instruction_sha256") == expected_hash:
+                return True
+        return False
+
+    def _finish_stop_if_acknowledged(self) -> bool:
+        if self._cursor.status != "stopping" or not self._stop_receipt_completed():
+            return False
+        self._cursor = Cursor(self._cursor.last_sequence, self._cursor.last_event_id, self._cursor.last_event_hash, "stopped", self._cursor.stop_instruction_id)
+        self._persist_cursor()
+        return True
 
     def poll(self) -> list[ActivationRecord]:
         """Consume newly appended targeted events and return new outcomes."""
@@ -313,8 +382,16 @@ class ParticipantMonitor:
                 event_id = str(event.get("event_id"))
                 if event_id not in self._results:
                     fresh.append(self._activate(event))
-            self._cursor = Cursor(sequence, str(event.get("event_id")), str(event.get("event_hash")))
+                record = self._results.get(event_id)
+                if event.get("event_type") == "stop_requested" and record is not None and record.status == "activated":
+                    instruction = self._instruction_for(event)
+                    if instruction and instruction.get("kind") == "stop":
+                        self._cursor = Cursor(sequence, str(event.get("event_id")), str(event.get("event_hash")), "stopping", str(instruction.get("instruction_id")))
+                        self._persist_cursor()
+                        continue
+            self._cursor = Cursor(sequence, str(event.get("event_id")), str(event.get("event_hash")), self._cursor.status, self._cursor.stop_instruction_id)
             self._persist_cursor()
+        self._finish_stop_if_acknowledged()
         return fresh
 
     def run_forever(self, interval_seconds: float = 2.0, *, stop_when_requested: bool = False) -> None:
@@ -323,10 +400,7 @@ class ParticipantMonitor:
             raise ValueError("interval_seconds must be positive")
         while True:
             results = self.poll()
-            if stop_when_requested and any(
-                item.event_type == "stop_requested" and item.status == "activated"
-                for item in results
-            ):
+            if stop_when_requested and self._cursor.status == "stopped":
                 return
             time.sleep(interval_seconds)
 

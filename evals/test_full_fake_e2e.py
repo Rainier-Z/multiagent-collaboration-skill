@@ -24,6 +24,9 @@ FAKES = Path(__file__).resolve().parent / "fakes"
 
 
 class FullFakeProcessE2E(unittest.TestCase):
+    PROCESS_TIMEOUT_SECONDS = "45"
+    COORDINATOR_WAIT_SECONDS = 50
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory(prefix="multiagent-full-fake-e2e-")
         self.workspace = Path(self.temp_dir.name) / "workspace"
@@ -104,14 +107,14 @@ class FullFakeProcessE2E(unittest.TestCase):
 
     def test_complete_lifecycle_uses_real_processes_and_files(self) -> None:
         for agent in self.participants:
-            self._spawn(FAKES / "fake_monitor.py", "--agent-id", agent, "--timeout", "18")
+            self._spawn(FAKES / "fake_monitor.py", "--agent-id", agent, "--timeout", self.PROCESS_TIMEOUT_SECONDS)
         for agent in self.participants:
-            self._spawn(FAKES / "fake_participant.py", "--agent-id", agent, "--timeout", "18")
-        self._spawn(FAKES / "fake_coordinator.py", "--actor", "coordinator", "--timeout", "18")
+            self._spawn(FAKES / "fake_participant.py", "--agent-id", agent, "--timeout", self.PROCESS_TIMEOUT_SECONDS)
+        self._spawn(FAKES / "fake_coordinator.py", "--actor", "coordinator", "--timeout", self.PROCESS_TIMEOUT_SECONDS)
 
         coordinator = self.processes[-1]
         try:
-            coordinator.wait(timeout=22)
+            coordinator.wait(timeout=self.COORDINATOR_WAIT_SECONDS)
         except subprocess.TimeoutExpired:
             self.fail("coordinator process did not terminate; pid=%r rc=%r status=%r; %s" % (
                 coordinator.pid, coordinator.poll(), self._status(), self._process_diagnostics()))

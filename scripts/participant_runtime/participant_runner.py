@@ -99,6 +99,7 @@ def _completed(
 ) -> None:
     write_receipt(workspace, agent_id, {
         "instruction_id": instruction.instruction_id,
+        "instruction_sha256": instruction.sha256,
         "kind": instruction.kind,
         "kind": instruction.kind,
         "agent_id": agent_id,

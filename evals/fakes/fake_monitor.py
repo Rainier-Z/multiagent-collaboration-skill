@@ -38,7 +38,7 @@ class DispatchBridge:
         self.workspace = workspace
         self.agent_id = agent_id
 
-    def activate(self, request: WakeRequest) -> ActivationResult:
+    def activate(self, request: WakeRequest, *, idempotency_key: str | None = None) -> ActivationResult:
         marker = (
             self.workspace / ".multiagent" / "fake-dispatch" / self.agent_id
             / (request.instruction_id + ".json")
@@ -72,9 +72,8 @@ def main() -> int:
     while time.monotonic() < deadline:
         try:
             results = monitor.poll()
-            for result in results:
-                if result.status == "activated" and _instruction_kind(workspace, args.agent_id, result.instruction_id or "") == "stop":
-                    return 0
+            if monitor.cursor.status == "stopped":
+                return 0
             last_error = ""
         except (MonitorError, OSError, ValueError) as error:
             # A concurrent append can be observed between write and newline

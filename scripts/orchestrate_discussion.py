@@ -31,7 +31,7 @@ from workflow_core import (
     path_in_workspace, sha256_file, update_content_hash,
     validate_coordinator_execution, validate_state_shape,
 )
-from events import EventStream
+from events import EventStream, reconcile_instruction_events
 from transactions import EventTransaction, commit_transaction, recover_transactions
 from transactions import commit_round_transition
 from convergence import AgentResponse, ConvergenceEvaluator, validate_convergence_assessment, ConvergenceSchemaError
@@ -648,6 +648,7 @@ def _publish_round_snapshot(
         "snapshot_path": snapshot_relative,
         "snapshot_sha256": snapshot_sha256,
         "status": "snapshot_published",
+        "snapshot_published_revision": expected_revision + 1,
         "published_at": _now(),
     }
     state_update = dict(state)
@@ -728,12 +729,16 @@ def _round_transition(
     if not convergence.get("converged") and current_round < configured_max:
         next_round = current_round + 1
         snapshot_source = path_in_workspace(workspace, snapshot_relative)
+        discussion_source = _main_markdown(workspace)
+        if discussion_source is None or not discussion_source.is_file():
+            raise WorkflowError("next round requires the authoritative discussion Markdown", E_SCHEMA)
         for agent in participants:
             prepared = prepare_inputs(
                 workspace,
                 agent,
                 [
                     (workspace / "project-context.md", "project-context.md"),
+                    (discussion_source, "discussion.md"),
                     (snapshot_source, "round-%d.md" % current_round),
                 ],
                 instruction_kind="respond",
@@ -1092,6 +1097,25 @@ def _all_stop_receipts_completed(
         except Exception:
             return False
         if not isinstance(evidence, dict) or (instruction.access_scope.get("security_mode", "strict") == "strict" and evidence != stop_evidence):
+            return False
+    return True
+
+
+def _all_monitors_stopped(workspace: Path, state: dict[str, Any], participants: list[str]) -> bool:
+    """Require each participant monitor to durably acknowledge its own stop."""
+    expected = (state.get("monitoring") or {}).get("stop_instruction_ids")
+    if not isinstance(expected, dict):
+        return False
+    for agent in participants:
+        instruction_id = expected.get(agent)
+        cursor_path = workspace / ".multiagent" / "monitors" / agent / "cursor.json"
+        try:
+            cursor = load_json(cursor_path)
+        except Exception:
+            return False
+        if not isinstance(cursor, dict) or cursor.get("agent_id") != agent:
+            return False
+        if cursor.get("status") != "stopped" or cursor.get("stop_instruction_id") != instruction_id:
             return False
     return True
 
@@ -1549,6 +1573,23 @@ def _evaluate_convergence(
             expected_round=current_round,
             actual_round=assessment.get("round"),
         )
+    metadata = (state.get("rounds") or {}).get(str(current_round))
+    if not isinstance(metadata, dict):
+        raise WorkflowError("Coordinator 收敛评估缺少已发布快照元数据", E_SCHEMA, round=current_round)
+    expected_path = metadata.get("snapshot_path")
+    expected_hash = metadata.get("snapshot_sha256")
+    published_revision = metadata.get("snapshot_published_revision")
+    if (
+        assessment.get("based_on_snapshot_path") != expected_path
+        or assessment.get("based_on_snapshot_sha256") != expected_hash
+        or not isinstance(published_revision, int)
+        or assessment.get("based_on_revision", 0) < published_revision
+    ):
+        raise WorkflowError(
+            "Coordinator 收敛评估未绑定当前已发布 round 快照",
+            E_STATE_CONFLICT,
+            path=str(path), round=current_round,
+        )
     return assessment
 
 
@@ -1570,6 +1611,9 @@ def orchestrate_once(
         state_path = _state_path(workspace)
         state = load_state(workspace)
         validate_state_shape(state)
+        # A crash after a transaction's state/artifacts commit but before its
+        # delivery signal must not strand an already-issued instruction.
+        reconcile_instruction_events(workspace, state)
         validate_coordinator_execution(state, actor or "", platform_id or "", session_id or "")
         ensure_content_consistency(workspace, state)
         _validate_round_snapshots(workspace, state)
@@ -1831,7 +1875,7 @@ def orchestrate_once(
 
         if state.get("stage") in {"finalizing", "confirmed_decision"}:
             receipts = _read_receipts(workspace)
-            if _all_stop_receipts_completed(workspace, state, receipts, participants):
+            if _all_stop_receipts_completed(workspace, state, receipts, participants) and _all_monitors_stopped(workspace, state, participants):
                 stopped_at = _now()
                 monitoring = dict(state.get("monitoring") or {})
                 monitoring.update({"enabled": False, "status": "stopped", "stopped_at": stopped_at})

@@ -207,6 +207,26 @@ class StateLock(AbstractContextManager["StateLock"]):
     def _pid_alive(pid: Any) -> bool:
         if not isinstance(pid, int) or pid <= 0:
             return False
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            # Windows 的 os.kill(pid, 0) 会发送 CTRL_C_EVENT，不能用于存活检查。
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+
+            handle = kernel32.OpenProcess(0x00100000, False, pid)
+            if not handle:
+                return ctypes.get_last_error() != 87
+            try:
+                return kernel32.WaitForSingleObject(handle, 0) != 0
+            finally:
+                kernel32.CloseHandle(handle)
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -214,10 +234,7 @@ class StateLock(AbstractContextManager["StateLock"]):
         except PermissionError:
             return True
         except OSError as exc:
-            # Windows reports a non-existent PID as ERROR_INVALID_PARAMETER
-            # (87) or ERROR_INVALID_HANDLE (6), rather than ProcessLookupError.
-            # POSIX may use ESRCH (3) for the same condition.
-            if getattr(exc, "winerror", None) in {6, 87} or getattr(exc, "errno", None) in {3, 22}:
+            if getattr(exc, "errno", None) in {3, 22}:
                 return False
             return True
         return True
@@ -243,8 +260,21 @@ class StateLock(AbstractContextManager["StateLock"]):
             owner = load_json(owner_path)
         except (WorkflowError, OSError):
             return False
-        if self._pid_alive(owner.get("pid")):
-            return False
+        pid = owner.get("pid")
+        if self._pid_alive(pid):
+            recorded_start = owner.get("process_start_time")
+            current_start = self._process_start_time(pid) if isinstance(pid, int) else None
+            # PID liveness alone is insufficient after OS PID reuse.  Only a
+            # comparable matching start marker proves that this is still the
+            # lock owner; unavailable markers retain the conservative lock.
+            if not (
+                isinstance(recorded_start, str)
+                and recorded_start
+                and isinstance(current_start, str)
+                and current_start
+                and recorded_start != current_start
+            ):
+                return False
         quarantine = self.path.parent / (".state.lock.reclaim-" + uuid.uuid4().hex)
         try:
             os.rename(self.path, quarantine)

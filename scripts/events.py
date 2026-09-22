@@ -222,4 +222,49 @@ class EventStream:
 EventLog = EventStream
 
 
-__all__ = ["EVENT_STREAM_RELATIVE_PATH", "EventLog", "EventStream", "EventStreamError"]
+def reconcile_instruction_events(workspace: str | Path, state: Mapping[str, Any]) -> list[str]:
+    """Restore missing instruction signals from durable instruction files.
+
+    Instructions and committed state are the durable business facts.  The
+    event stream is their recoverable delivery signal, so a coordinator restart
+    repairs only missing ``instruction-<id>`` events and never rewrites an
+    instruction or advances state.
+    """
+    root = Path(workspace).resolve()
+    instruction_root = root / ".multiagent" / "instructions"
+    if not instruction_root.is_dir():
+        return []
+    stream = EventStream(root)
+    existing = {str(item.get("event_id")) for item in stream.read()}
+    restored: list[str] = []
+    revision = int(state.get("revision", 0))
+    for path in sorted(instruction_root.glob("*/*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise EventStreamError("指令文件无法用于事件补偿", E_SCHEMA, path=str(path)) from exc
+        if not isinstance(payload, dict):
+            raise EventStreamError("指令文件必须是对象", E_SCHEMA, path=str(path))
+        instruction_id = payload.get("instruction_id")
+        agent_id = payload.get("agent_id")
+        kind = payload.get("kind")
+        if not all(isinstance(value, str) and value for value in (instruction_id, agent_id, kind)):
+            raise EventStreamError("指令文件缺少事件补偿所需身份字段", E_SCHEMA, path=str(path))
+        event_id = "instruction-" + instruction_id
+        if event_id in existing:
+            continue
+        stream.append(
+            "instruction_issued",
+            {"agent_id": agent_id, "instruction_id": instruction_id, "kind": kind,
+             "activation_status": "pending_monitor", "reconciled": True},
+            transaction_id=event_id,
+            revision_before=revision,
+            revision_after=revision,
+            event_id=event_id,
+        )
+        existing.add(event_id)
+        restored.append(instruction_id)
+    return restored
+
+
+__all__ = ["EVENT_STREAM_RELATIVE_PATH", "EventLog", "EventStream", "EventStreamError", "reconcile_instruction_events"]

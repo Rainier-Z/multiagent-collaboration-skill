@@ -70,8 +70,12 @@ def _write_assessment(workspace: Path, participants: list[str], round_number: in
     if path.is_file():
         return
     converged = round_number >= 2
+    metadata = _state(workspace)["rounds"][str(round_number)]
     payload = {
         "round": round_number,
+        "based_on_snapshot_path": metadata["snapshot_path"],
+        "based_on_snapshot_sha256": metadata["snapshot_sha256"],
+        "based_on_revision": metadata["snapshot_published_revision"],
         "new_substantive_issues": [] if converged else ["需要第二轮验证"],
         "unanswered_arguments": [] if converged else ["Round 1 的证据需要回应"],
         "new_evidence": ["三个真实 participant 进程已写入回执"],
@@ -113,7 +117,12 @@ def main() -> int:
             participants = list(state["expected_participants"])
             if state.get("stage") == "cross_response":
                 current_round = int(state.get("round", 1) or 1)
-                if _responses_complete(workspace, participants, current_round):
+                round_metadata = (state.get("rounds") or {}).get(str(current_round))
+                if (
+                    isinstance(round_metadata, dict)
+                    and round_metadata.get("status") == "snapshot_published"
+                    and _responses_complete(workspace, participants, current_round)
+                ):
                     _write_assessment(workspace, participants, current_round)
             if state.get("stage") == "human_review" and not confirmed:
                 code = _confirm(workspace, args.actor)

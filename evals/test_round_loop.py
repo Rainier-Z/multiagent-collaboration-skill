@@ -80,8 +80,12 @@ class AtomicRoundLoopTests(unittest.TestCase):
     def _write_assessment(self, round_number: int, *, converged: bool = False) -> None:
         path = self.internal / "convergence" / f"round-{round_number}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
+        metadata = self._read_state()["rounds"][str(round_number)]
         path.write_text(json.dumps({
             "round": round_number,
+            "based_on_snapshot_path": metadata["snapshot_path"],
+            "based_on_snapshot_sha256": metadata["snapshot_sha256"],
+            "based_on_revision": metadata["snapshot_published_revision"],
             "new_substantive_issues": [] if converged else ["待验证"],
             "unanswered_arguments": [] if converged else ["待回应"],
             "new_evidence": ["round snapshot"],
@@ -166,6 +170,25 @@ class AtomicRoundLoopTests(unittest.TestCase):
         snapshot = self.internal / "rounds" / "round-1.md"
         original = snapshot.read_bytes()
         snapshot.write_bytes(original + b"tampered\n")
+        with self.assertRaises(Exception):
+            orchestrate_once(self.workspace, FakeWakeAdapter(), actor="coordinator", platform_id="codex", session_id="session-coordinator", open_candidate=False)
+
+    def test_preseeded_assessment_with_wrong_snapshot_binding_is_rejected(self) -> None:
+        self._drive_proposals()
+        for agent in self.participants:
+            self._write_receipt(self._instructions(agent, "respond")[-1], "### 共识点\n- x\n### 分歧点\n### 新问题\n")
+        # This assessment was prepared before the immutable round snapshot
+        # existed, therefore it cannot authorize the next transition.
+        path = self.internal / "convergence" / "round-1.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "round": 1, "based_on_snapshot_path": ".multiagent/rounds/round-1.md",
+            "based_on_snapshot_sha256": "0" * 64, "based_on_revision": 1,
+            "new_substantive_issues": [], "unanswered_arguments": [], "new_evidence": [],
+            "remaining_disagreements": [], "positions": {}, "value_conflicts": [],
+            "more_discussion": False, "requires_human_decision": True,
+            "converged": True, "reason": "preseeded",
+        }), encoding="utf-8")
         with self.assertRaises(Exception):
             orchestrate_once(self.workspace, FakeWakeAdapter(), actor="coordinator", platform_id="codex", session_id="session-coordinator", open_candidate=False)
 

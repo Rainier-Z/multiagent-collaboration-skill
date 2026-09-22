@@ -24,7 +24,7 @@ class FakeBridge:
         self.result = result or ActivationResult("activated", evidence="fake-dispatch")
         self.requests: list[WakeRequest] = []
 
-    def activate(self, request: WakeRequest) -> ActivationResult:
+    def activate(self, request: WakeRequest, *, idempotency_key: str | None = None) -> ActivationResult:
         self.requests.append(request)
         return self.result
 

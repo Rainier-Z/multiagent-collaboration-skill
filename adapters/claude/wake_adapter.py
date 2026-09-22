@@ -27,7 +27,7 @@ class ClaudeCodeWakeAdapter:
     def __init__(self, dispatcher: Callable[[WakeRequest], ActivationResult | WakeResult] | None = None) -> None:
         self._dispatcher = dispatcher
 
-    def activate(self, request: WakeRequest) -> ActivationResult:
+    def activate(self, request: WakeRequest, *, idempotency_key: str | None = None) -> ActivationResult:
         """Attempt explicit activation; a scanner is never a dispatcher."""
         if self._dispatcher is None:
             return manual_activation_required(self.platform)

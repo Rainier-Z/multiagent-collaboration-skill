@@ -30,6 +30,9 @@ from convergence import (  # type: ignore[import-not-found]
 def modern_assessment(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "round": 2,
+        "based_on_snapshot_path": ".multiagent/rounds/round-2.md",
+        "based_on_snapshot_sha256": "a" * 64,
+        "based_on_revision": 12,
         "new_substantive_issues": ["暂无"],
         "unanswered_arguments": ["没有"],
         "new_evidence": ["N/A"],

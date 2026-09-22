@@ -41,8 +41,17 @@ class CandidateTransactionTests(AtomicRoundLoopTests):
         for agent in self.participants:
             instruction = self._instructions(agent, "respond")[-1]
             self._write_receipt(instruction, "### 共识点\n- bounded\n### 分歧点\n### 新问题\n")
+        orchestrate_once(
+            self.workspace, FakeWakeAdapter(), actor="coordinator",
+            platform_id="codex", session_id="session-coordinator",
+            open_candidate=False,
+        )
+        metadata = self._read_state()["rounds"]["1"]
         assessment = {
             "round": 1, "new_substantive_issues": [], "unanswered_arguments": [],
+            "based_on_snapshot_path": metadata["snapshot_path"],
+            "based_on_snapshot_sha256": metadata["snapshot_sha256"],
+            "based_on_revision": metadata["snapshot_published_revision"],
             "new_evidence": [], "remaining_disagreements": [],
             "positions": {agent: ["bounded"] for agent in self.participants},
             "value_conflicts": [], "more_discussion": False,

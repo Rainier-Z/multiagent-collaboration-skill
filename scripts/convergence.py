@@ -52,6 +52,9 @@ def _normalize_content(value: Any) -> Any:
 
 _ASSESSMENT_FIELDS = (
     "round",
+    "based_on_snapshot_path",
+    "based_on_snapshot_sha256",
+    "based_on_revision",
     "new_substantive_issues",
     "unanswered_arguments",
     "new_evidence",
@@ -77,6 +80,9 @@ class ConvergenceAssessment:
     """
 
     round: int
+    based_on_snapshot_path: str
+    based_on_snapshot_sha256: str
+    based_on_revision: int
     new_substantive_issues: tuple[str, ...] = ()
     unanswered_arguments: tuple[str, ...] = ()
     new_evidence: tuple[str, ...] = ()
@@ -91,6 +97,12 @@ class ConvergenceAssessment:
     def __post_init__(self) -> None:
         if isinstance(self.round, bool) or not isinstance(self.round, int) or self.round < 1:
             raise ConvergenceSchemaError("round must be a positive integer")
+        if not isinstance(self.based_on_snapshot_path, str) or not self.based_on_snapshot_path.strip():
+            raise ConvergenceSchemaError("based_on_snapshot_path must be a non-empty string")
+        if not isinstance(self.based_on_snapshot_sha256, str) or len(self.based_on_snapshot_sha256) != 64:
+            raise ConvergenceSchemaError("based_on_snapshot_sha256 must be a SHA-256 string")
+        if isinstance(self.based_on_revision, bool) or not isinstance(self.based_on_revision, int) or self.based_on_revision < 1:
+            raise ConvergenceSchemaError("based_on_revision must be a positive integer")
         for name in (
             "new_substantive_issues",
             "unanswered_arguments",
@@ -156,6 +168,9 @@ class ConvergenceAssessment:
         more_discussion = payload.get("more_discussion", payload.get("would_more_discussion_add_information"))
         assessment = cls(
             round=payload.get("round"),  # type: ignore[arg-type]
+            based_on_snapshot_path=payload.get("based_on_snapshot_path"),  # type: ignore[arg-type]
+            based_on_snapshot_sha256=payload.get("based_on_snapshot_sha256"),  # type: ignore[arg-type]
+            based_on_revision=payload.get("based_on_revision"),  # type: ignore[arg-type]
             new_substantive_issues=payload.get("new_substantive_issues"),  # type: ignore[arg-type]
             unanswered_arguments=payload.get("unanswered_arguments"),  # type: ignore[arg-type]
             new_evidence=payload.get("new_evidence"),  # type: ignore[arg-type]
@@ -184,6 +199,9 @@ class ConvergenceAssessment:
         """Return the canonical fixed-schema JSON-compatible mapping."""
         return {
             "round": self.round,
+            "based_on_snapshot_path": self.based_on_snapshot_path,
+            "based_on_snapshot_sha256": self.based_on_snapshot_sha256,
+            "based_on_revision": self.based_on_revision,
             "new_substantive_issues": list(self.new_substantive_issues),
             "unanswered_arguments": list(self.unanswered_arguments),
             "new_evidence": list(self.new_evidence),

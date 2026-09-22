@@ -15,9 +15,9 @@ from typing import Literal, Protocol
 
 
 WakeStatus = Literal["accepted", "unavailable", "rejected"]
-ActivationStatus = Literal["activated", "manual_activation_required", "activation_failed"]
+ActivationStatus = Literal["activated", "manual_activation_required", "activation_failed", "activation_pending", "activation_unknown"]
 _VALID_STATUSES = frozenset({"accepted", "unavailable", "rejected"})
-_VALID_ACTIVATION_STATUSES = frozenset({"activated", "manual_activation_required", "activation_failed"})
+_VALID_ACTIVATION_STATUSES = frozenset({"activated", "manual_activation_required", "activation_failed", "activation_pending", "activation_unknown"})
 
 
 @dataclass(frozen=True)
@@ -115,8 +115,8 @@ class WakeAdapter(Protocol):
 class ActivationBridge(Protocol):
     """Platform activation boundary used by sensors and explicit callers."""
 
-    def activate(self, request: WakeRequest) -> ActivationResult:
-        """Activate one bound session; scanning alone is never activation."""
+    def activate(self, request: WakeRequest, *, idempotency_key: str | None = None) -> ActivationResult:
+        """Activate one bound session with the event id as idempotency key."""
 
 
 def unavailable(platform: str, detail: str = "") -> WakeResult:

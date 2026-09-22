@@ -24,7 +24,7 @@ class CodexWakeAdapter:
     def __init__(self, dispatcher: Callable[[WakeRequest], ActivationResult | WakeResult] | None = None) -> None:
         self._dispatcher = dispatcher
 
-    def activate(self, request: WakeRequest) -> ActivationResult:
+    def activate(self, request: WakeRequest, *, idempotency_key: str | None = None) -> ActivationResult:
         if self._dispatcher is None:
             return manual_activation_required(self.platform)
         try:
