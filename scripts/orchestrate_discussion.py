@@ -13,6 +13,7 @@ import hashlib
 import json
 import re
 import sys
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -510,7 +511,8 @@ def _issue(
         revision_before = int(state.get("revision", 0))
         EventTransaction(
             workspace,
-            transaction_id="instruction-%s-%s" % (instruction.agent_id, instruction.instruction_id),
+            transaction_id="instruction-%s-%s-%s"
+            % (instruction.agent_id, instruction.instruction_id, uuid.uuid4().hex),
         ).commit(
             event_type="instruction_issued",
             event_id="instruction-" + instruction.instruction_id,
