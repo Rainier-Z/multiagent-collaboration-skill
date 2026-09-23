@@ -42,6 +42,8 @@ from adapters.common.wake_protocol import (
     WakeRequest,
     manual_activation_required,
 )
+from participant_runtime.protocol import Instruction
+from stop_receipts import validate_completed_stop_receipt
 
 
 CURSOR_RELATIVE = ".multiagent/monitors/{agent_id}/cursor.json"
@@ -346,18 +348,44 @@ class ParticipantMonitor:
         self._persist_results()
         return record
 
+    def _activation_for_instruction(self, event: Mapping[str, Any]) -> ActivationRecord | None:
+        """Return a prior durable activation for the event's instruction, if any.
+
+        A stop instruction has both an ``instruction_issued`` delivery event and
+        a later ``stop_requested`` lifecycle event.  They must share one bridge
+        activation while the latter event still advances the stop cursor.
+        """
+        instruction = self._instruction_for(event)
+        instruction_id = instruction.get("instruction_id") if isinstance(instruction, Mapping) else None
+        if not isinstance(instruction_id, str):
+            return None
+        return next(
+            (record for record in self._results.values() if record.instruction_id == instruction_id),
+            None,
+        )
+
     def _stop_receipt_completed(self) -> bool:
         instruction_id = self._cursor.stop_instruction_id
         if not instruction_id:
             return False
-        instruction = self._instruction_for({"payload": {"instruction_id": instruction_id}})
-        if not instruction or instruction.get("kind") != "stop" or instruction.get("agent_id") != self.agent_id:
+        raw_instruction = self._instruction_for({"payload": {"instruction_id": instruction_id}})
+        if not raw_instruction:
             return False
-        expected_hash = instruction.get("sha256")
+        try:
+            instruction = Instruction.from_dict(raw_instruction)
+        except Exception:
+            return False
+        state = _load_object(self.workspace / ".multiagent" / "state.json")
+        if not isinstance(state, dict):
+            return False
         root = self.workspace / ".multiagent" / "receipts" / self.agent_id
         for path in root.glob("*.json") if root.is_dir() else ():
             receipt = _load_object(path)
-            if receipt and receipt.get("instruction_id") == instruction_id and receipt.get("agent_id") == self.agent_id and receipt.get("kind") == "stop" and receipt.get("status") == "completed" and receipt.get("instruction_sha256") == expected_hash:
+            if isinstance(receipt, dict):
+                receipt["_path"] = path
+            if isinstance(receipt, dict) and validate_completed_stop_receipt(
+                self.workspace, state, self.agent_id, instruction, receipt,
+            ):
                 return True
         return False
 
@@ -381,8 +409,12 @@ class ParticipantMonitor:
             if event.get("event_type") in INTERESTING_EVENTS and self._is_targeted(event):
                 event_id = str(event.get("event_id"))
                 if event_id not in self._results:
-                    fresh.append(self._activate(event))
+                    prior = self._activation_for_instruction(event)
+                    if prior is None:
+                        fresh.append(self._activate(event))
                 record = self._results.get(event_id)
+                if record is None:
+                    record = self._activation_for_instruction(event)
                 if event.get("event_type") == "stop_requested" and record is not None and record.status == "activated":
                     instruction = self._instruction_for(event)
                     if instruction and instruction.get("kind") == "stop":

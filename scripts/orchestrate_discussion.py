@@ -36,10 +36,10 @@ from transactions import EventTransaction, commit_transaction, recover_transacti
 from transactions import commit_round_transition
 from convergence import AgentResponse, ConvergenceEvaluator, validate_convergence_assessment, ConvergenceSchemaError
 from participant_runtime.protocol import (
-    Instruction, Receipt, instruction_path, isolation_evidence_path, load_isolation_evidence,
-    load_stop_attestation,
-    receipt_path, validate_input_manifest, write_instruction,
+    Instruction, instruction_path, isolation_evidence_path, load_isolation_evidence,
+    validate_input_manifest, write_instruction,
 )
+from stop_receipts import validate_completed_stop_receipt
 from instruction_prompts import build_task_prompt
 from participant_views import (
     access_scope as sealed_access_scope,
@@ -506,11 +506,29 @@ def _issue(
         root_instruction_id=root_instruction_id,
         failure_receipt=failure_receipt,
     )
+    if _round_lifecycle(state):
+        revision_before = int(state.get("revision", 0))
+        EventTransaction(
+            workspace,
+            transaction_id="instruction-%s-%s" % (instruction.agent_id, instruction.instruction_id),
+        ).commit(
+            event_type="instruction_issued",
+            event_id="instruction-" + instruction.instruction_id,
+            event_payload={
+                "agent_id": instruction.agent_id,
+                "instruction_id": instruction.instruction_id,
+                "kind": instruction.kind,
+                "activation_status": "pending_monitor",
+            },
+            artifacts=_instruction_artifacts(workspace, instruction),
+            expected_revision=revision_before,
+            state_update=state,
+        )
+        state["revision"] = revision_before + 1
+        result.issued_instruction_ids.append(instruction.instruction_id)
+        return
     write_instruction(workspace, instruction)
     result.issued_instruction_ids.append(instruction.instruction_id)
-    if _round_lifecycle(state):
-        _modern_instruction_event(workspace, state, instruction)
-        return
     binding = _participant_binding(state, agent_id)
     request = WakeRequest(workspace, agent_id, instruction.instruction_id, instruction.runtime_version,
                           binding["platform_id"], binding["session_id"])
@@ -1041,18 +1059,6 @@ def _all_stop_receipts_completed(
 
     for agent in participants:
         instruction = instructions[agent]
-        try:
-            binding = _participant_binding(state, agent)
-        except Exception:
-            return False
-        if (
-            instruction.discussion_id != state.get("discussion_id")
-            or instruction.platform_id != binding["platform_id"]
-            or instruction.session_id != binding["session_id"]
-            or instruction.output_path != ".multiagent/receipts/%s" % agent
-            or instruction.state_revision > int(state.get("revision", -1))
-        ):
-            return False
         matches = [
             record for record in receipts
             if record.get("agent_id") == agent
@@ -1061,42 +1067,7 @@ def _all_stop_receipts_completed(
         ]
         if len(matches) != 1:
             return False
-        receipt = matches[0]
-        if receipt.get("instruction_id") != instruction.instruction_id:
-            return False
-        expected_receipt_path = receipt_path(
-            workspace, agent, instruction.instruction_id, "completed",
-        )
-        if (
-            not isinstance(receipt.get("_path"), Path)
-            or receipt["_path"].resolve() != expected_receipt_path.resolve()
-            or receipt.get("runtime_version") != instruction.runtime_version
-            or receipt.get("state_revision") != instruction.state_revision
-            or receipt.get("attempt") != instruction.attempt
-        ):
-            return False
-        try:
-            # Re-verify the receipt signature against the external trust registry;
-            # a runner-authored marker alone is never stop evidence.
-            Receipt.from_dict(receipt)
-        except Exception:
-            return False
-        marker_path = ".multiagent/receipts/%s/%s-stop-marker.txt" % (agent, instruction.instruction_id)
-        if receipt.get("output_path") != marker_path:
-            return False
-        try:
-            marker = path_in_workspace(workspace, marker_path)
-            if not marker.is_file() or receipt.get("output_sha256") != sha256_file(marker):
-                return False
-            manifest = validate_input_manifest(workspace, instruction)
-            evidence = receipt.get("isolation_evidence")
-            if instruction.access_scope.get("security_mode", "strict") == "strict":
-                stop_evidence = load_stop_attestation(workspace, instruction)
-            else:
-                stop_evidence = evidence
-        except Exception:
-            return False
-        if not isinstance(evidence, dict) or (instruction.access_scope.get("security_mode", "strict") == "strict" and evidence != stop_evidence):
+        if not validate_completed_stop_receipt(workspace, state, agent, instruction, matches[0]):
             return False
     return True
 
@@ -1715,6 +1686,7 @@ def orchestrate_once(
 
         if state.get("stage") in {"initialized", "independent_proposal"} and _valid_completed_outputs(workspace, state, receipts, participants, {"propose", "repair"}, "proposals"):
             if modern_rounds:
+                revision_before = int(state.get("revision", revision_before))
                 state = _proposal_transition(
                     workspace, state, participants, wake, result,
                     expected_revision=revision_before,
@@ -1917,6 +1889,7 @@ def orchestrate_once(
             changed = True
 
         if changed:
+            revision_before = int(state.get("revision", revision_before))
             update_content_hash(workspace, state)
             state["last_orchestrated_at"] = _now()
             transaction = EventTransaction(workspace)

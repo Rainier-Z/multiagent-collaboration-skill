@@ -249,6 +249,7 @@ class EventTransaction:
         *,
         event_type: str,
         event_payload: Mapping[str, Any] | None = None,
+        event_id: str | None = None,
         artifacts: Mapping[str, Any] | None = None,
         receipts: Mapping[str, Any] | None = None,
         deletions: Iterable[str | Path] | None = None,
@@ -343,6 +344,7 @@ class EventTransaction:
                  "deleted_paths": [item["target"] for item in operations if item["kind"] == "delete"]},
                 transaction_id=self.transaction_id,
                 revision_before=state["revision"], revision_after=next_state["revision"],
+                event_id=event_id,
             )
             journal["event"] = event
             journal["status"] = "event_appended"
@@ -501,6 +503,7 @@ def commit_transaction(
     *,
     event_type: str,
     event_payload: Mapping[str, Any] | None = None,
+    event_id: str | None = None,
     artifacts: Mapping[str, Any] | None = None,
     receipts: Mapping[str, Any] | None = None,
     deletions: Iterable[str | Path] | None = None,
@@ -512,7 +515,7 @@ def commit_transaction(
 ) -> dict[str, Any]:
     """Convenience function for the common one-shot transaction case."""
     tx = EventTransaction(workspace, transaction_id=transaction_id, fault_hook=fault_hook)
-    return tx.commit(event_type=event_type, event_payload=event_payload,
+    return tx.commit(event_type=event_type, event_payload=event_payload, event_id=event_id,
                      artifacts=artifacts, receipts=receipts,
                      deletions=deletions,
                      precondition=precondition, expected_revision=expected_revision,

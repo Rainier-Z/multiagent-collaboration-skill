@@ -89,6 +89,30 @@ class ParticipantMonitorTests(unittest.TestCase):
             "event-evt-final", "event-evt-stop"
         ])
 
+    def test_stop_requested_reuses_the_instruction_issued_activation(self) -> None:
+        workspace = self._workspace()
+        instruction = workspace / ".multiagent" / "instructions" / "claude" / "I-stop.json"
+        instruction.write_text(json.dumps({
+            "instruction_id": "I-stop", "agent_id": "claude", "kind": "stop",
+            "runtime_version": "1.0", "platform_id": "claude-code", "session_id": "session-1",
+        }), encoding="utf-8")
+        stream = EventStream(workspace)
+        stream.append(
+            "instruction_issued",
+            {"agent_id": "claude", "instruction_id": "I-stop", "kind": "stop"},
+            event_id="instruction-I-stop",
+        )
+        stream.append(
+            "stop_requested",
+            {"agent_ids": ["claude"], "instruction_ids": {"claude": "I-stop"}},
+            event_id="stop-requested-D-1",
+        )
+        bridge = FakeBridge()
+        monitor = ParticipantMonitor(workspace, "claude", bridge)
+        monitor.poll()
+        self.assertEqual([request.instruction_id for request in bridge.requests], ["I-stop"])
+        self.assertEqual(monitor.cursor.status, "stopping")
+
     def test_unconfigured_bridge_reports_manual_activation_required(self) -> None:
         workspace = self._workspace()
         EventStream(workspace).append(

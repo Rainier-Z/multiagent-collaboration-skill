@@ -82,7 +82,7 @@ class RuntimeHardeningTests(unittest.TestCase):
         self.assertEqual(restarted_bridge.requests, [])
         self.assertEqual(restarted.activation_results[0].status, "activation_unknown")
 
-    def test_stop_receipt_is_required_before_monitor_stops(self) -> None:
+    def test_incomplete_stop_receipt_does_not_stop_monitor(self) -> None:
         self._instruction("I-stop", "stop")
         EventStream(self.root).append("stop_requested", {"agent_ids": ["claude"], "instruction_ids": {"claude": "I-stop"}}, event_id="evt-stop")
         bridge = RecordingBridge()
@@ -92,7 +92,7 @@ class RuntimeHardeningTests(unittest.TestCase):
         receipt = self.root / ".multiagent" / "receipts" / "claude" / "I-stop-completed.json"
         atomic_write_json(receipt, {"instruction_id": "I-stop", "instruction_sha256": "a" * 64, "agent_id": "claude", "kind": "stop", "status": "completed"})
         monitor.poll()
-        self.assertEqual(monitor.cursor.status, "stopped")
+        self.assertEqual(monitor.cursor.status, "stopping")
 
     def test_pid_reuse_reclaims_a_live_but_different_process_owner(self) -> None:
         lock_dir = self.root / ".multiagent" / ".state.lock"
